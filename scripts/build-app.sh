@@ -11,8 +11,8 @@ if [[ "${UNIVERSAL:-0}" == "1" ]]; then
     arch_flags=(--arch arm64 --arch x86_64)
 fi
 
-swift build -c release "${arch_flags[@]}" --product MacClean
-bin_dir="$(swift build -c release "${arch_flags[@]}" --show-bin-path)"
+swift build -c release ${arch_flags[@]+"${arch_flags[@]}"} --product MacClean
+bin_dir="$(swift build -c release ${arch_flags[@]+"${arch_flags[@]}"} --show-bin-path)"
 
 app="$root/build/MacClean.app"
 rm -rf "$app"

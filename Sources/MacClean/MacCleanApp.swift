@@ -10,7 +10,7 @@ struct MacCleanApp: App {
         // destructive runs must not be possible
         Window("맥클린", id: "main") {
             RootView()
-                .frame(minWidth: 860, minHeight: 600)
+                .frame(minWidth: 920, minHeight: 640)
         }
         .windowResizability(.contentMinSize)
     }
@@ -35,6 +35,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
 
+enum PaneSection: String, CaseIterable, Identifiable {
+    case monitor = "모니터링"
+    case manage = "정리 및 관리"
+    case system = "시스템"
+
+    var id: String { rawValue }
+}
+
 enum Pane: String, CaseIterable, Identifiable {
     case dashboard = "대시보드"
     case clean = "정리"
@@ -44,14 +52,45 @@ enum Pane: String, CaseIterable, Identifiable {
     case settings = "설정"
 
     var id: String { rawValue }
+
+    var section: PaneSection {
+        switch self {
+        case .dashboard: return .monitor
+        case .clean, .analyze, .uninstall: return .manage
+        case .optimize, .settings: return .system
+        }
+    }
+
     var symbol: String {
         switch self {
         case .dashboard: return "gauge.with.dots.needle.67percent"
         case .clean: return "sparkles"
-        case .analyze: return "internaldrive"
-        case .uninstall: return "trash"
-        case .optimize: return "speedometer"
-        case .settings: return "gearshape"
+        case .analyze: return "internaldrive.fill"
+        case .uninstall: return "trash.fill"
+        case .optimize: return "bolt.shield.fill"
+        case .settings: return "gearshape.fill"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .dashboard: return .blue
+        case .clean: return .teal
+        case .analyze: return .indigo
+        case .uninstall: return .pink
+        case .optimize: return .orange
+        case .settings: return .secondary
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .dashboard: return "실시간 자원 사용량과 시스템 건강 상태"
+        case .clean: return "사용자 캐시, 로그, 개발 도구 캐시 정리"
+        case .analyze: return "폴더별 공간 점유 현황과 대용량 파일 탐색"
+        case .uninstall: return "앱 번들과 숨은 라이브러리 잔여물 제거"
+        case .optimize: return "시스템 진단 및 유지보수 작업 실행"
+        case .settings: return "권한, 화이트리스트, 작업 로그 관리"
         }
     }
 }
@@ -66,10 +105,22 @@ struct RootView: View {
 
     var body: some View {
         NavigationSplitView {
-            List(Pane.allCases, selection: $pane) { p in
-                Label(p.rawValue, systemImage: p.symbol).tag(p)
+            VStack(spacing: 0) {
+                sidebarBrandHeader
+                Divider().opacity(0.5)
+                List(selection: $pane) {
+                    ForEach(PaneSection.allCases) { sec in
+                        Section(sec.rawValue) {
+                            ForEach(Pane.allCases.filter { $0.section == sec }) { p in
+                                SidebarRow(pane: p, isSelected: pane == p)
+                                    .tag(p)
+                            }
+                        }
+                    }
+                }
+                .listStyle(.sidebar)
             }
-            .navigationSplitViewColumnWidth(min: 160, ideal: 180)
+            .navigationSplitViewColumnWidth(min: 195, ideal: 210, max: 240)
         } detail: {
             switch pane {
             case .dashboard: DashboardView(model: status)
@@ -80,5 +131,115 @@ struct RootView: View {
             case .settings: SettingsView()
             }
         }
+    }
+
+    private var sidebarBrandHeader: some View {
+        HStack(spacing: 10) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [Color(red: 0.25, green: 0.68, blue: 0.98), Color(red: 0.16, green: 0.41, blue: 0.90)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                    .frame(width: 32, height: 32)
+                    .shadow(color: .blue.opacity(0.25), radius: 4, x: 0, y: 2)
+                Image(systemName: "sparkles")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text("맥클린")
+                    .font(.system(size: 14, weight: .bold))
+                Text("MacClean")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+    }
+}
+
+struct SidebarRow: View {
+    let pane: Pane
+    let isSelected: Bool
+
+    var body: some View {
+        HStack(spacing: 9) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(isSelected ? Color.white.opacity(0.22) : pane.tint.opacity(0.14))
+                    .frame(width: 24, height: 24)
+                Image(systemName: pane.symbol)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(isSelected ? Color.white : pane.tint)
+            }
+            Text(pane.rawValue)
+                .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+// MARK: - Shared UI Components
+
+struct PaneHeaderBar<Trailing: View>: View {
+    let pane: Pane
+    @ViewBuilder var trailing: () -> Trailing
+
+    init(pane: Pane, @ViewBuilder trailing: @escaping () -> Trailing = { EmptyView() }) {
+        self.pane = pane
+        self.trailing = trailing
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(pane.tint.opacity(0.14))
+                    .frame(width: 36, height: 36)
+                Image(systemName: pane.symbol)
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(pane.tint)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(pane.rawValue)
+                    .font(.title3.weight(.bold))
+                Text(pane.subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            trailing()
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+        .background(.bar)
+    }
+}
+
+struct StatusPill: View {
+    let text: String
+    let color: Color
+    var icon: String? = nil
+
+    var body: some View {
+        HStack(spacing: 4) {
+            if let icon {
+                Image(systemName: icon)
+                    .font(.system(size: 10, weight: .semibold))
+            }
+            Text(text)
+                .font(.system(size: 11, weight: .medium))
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .foregroundStyle(color)
+        .background(color.opacity(0.13), in: Capsule())
     }
 }
