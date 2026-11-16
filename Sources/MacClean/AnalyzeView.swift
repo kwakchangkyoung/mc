@@ -50,9 +50,18 @@ final class AnalyzeModel: ObservableObject {
                 guard cancellation === token, !r.cancelled else { return }
                 result = r
                 node = r.tree
+                // the list shown during the scan may have let the user select an
+                // entry that no longer exists — a stale path has no identity to recheck
+                if let sel = selection,
+                   !r.entries.contains(where: { $0.path == sel }),
+                   !r.largeFiles.contains(where: { $0.path == sel }) {
+                    selection = nil
+                }
                 scanning = false
             } catch {
                 guard cancellation === token else { return }
+                result = nil
+                node = nil
                 self.error = "\(t)을(를) 읽을 수 없습니다."
                 scanning = false
             }
@@ -61,11 +70,15 @@ final class AnalyzeModel: ObservableObject {
 
     func stopScan() {
         cancellation?.cancel()
+        error = "스캔을 중지했습니다"
         scanning = false
     }
 
     /// Show a cached subtree instantly — same shape as a fresh scan of that directory.
     private func apply(_ target: AnalyzeNode) {
+        // a scan still in flight would later overwrite this view — kill it first
+        cancellation?.cancel()
+        cancellation = nil
         path = target.path
         node = target
         result = target.asResult()
@@ -80,7 +93,7 @@ final class AnalyzeModel: ObservableObject {
     }
 
     func drill(_ entry: AnalyzeEntry) {
-        guard entry.isDir else { return }
+        guard entry.isDir, !scanning else { return }
         // symlink targets, other volumes and folded dirs need a fresh walk: rescan
         if let child = node?.dirs.first(where: { $0.path == entry.path }),
            !child.isOtherDevice, child.collected {
@@ -109,8 +122,8 @@ final class AnalyzeModel: ObservableObject {
     }
 
     func trashSelected() {
-        guard let target = selection else { return }
-        let expected = selectedIdentity
+        // no scan-time identity → nothing to recheck before trashing, so refuse
+        guard let target = selection, let expected = selectedIdentity else { return }
         Task {
             let outcome = await Task.detached(priority: .userInitiated) { () -> DeleteOutcome in
                 do {
@@ -182,6 +195,7 @@ struct AnalyzeView: View {
             Button { model.goBack() } label: {
                 Image(systemName: "chevron.left")
             }
+            .accessibilityLabel("뒤로")
             .disabled(!model.canGoBack)
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 3) {
@@ -247,6 +261,7 @@ struct AnalyzeView: View {
                             model.selection = entry.path
                             confirmingTrash = true
                         }
+                        .disabled(model.scanning)
                     }
             }
         }
@@ -278,6 +293,7 @@ struct AnalyzeView: View {
                         model.selection = file.path
                         confirmingTrash = true
                     }
+                    .disabled(model.scanning)
                 }
             }
         }

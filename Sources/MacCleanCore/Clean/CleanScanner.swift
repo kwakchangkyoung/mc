@@ -43,11 +43,15 @@ public struct CleanEngine: Sendable {
     public let home: String
     public let deleter: SafeDeleter
     public let rules: [CleanRule]
+    /// Probe capture seam (tests); live state is re-read before each rule's deletions.
+    public var captureProbes: @Sendable () -> ProbeContext
 
-    public init(home: String, deleter: SafeDeleter, rules: [CleanRule] = CleanCatalog.rules) {
+    public init(home: String, deleter: SafeDeleter, rules: [CleanRule] = CleanCatalog.rules,
+                captureProbes: @escaping @Sendable () -> ProbeContext = { ProbeContext.capture() }) {
         self.home = home
         self.deleter = deleter
         self.rules = rules
+        self.captureProbes = captureProbes
     }
 
     // MARK: scan
@@ -115,32 +119,44 @@ public struct CleanEngine: Sendable {
     // MARK: execute
 
     public func execute(_ items: [CleanItem], rulesByID: [String: CleanRule]? = nil) -> CleanExecutionResult {
-        let probes = ProbeContext.capture()   // fresh state right before deleting
         let lookup = rulesByID ?? Dictionary(uniqueKeysWithValues: rules.map { ($0.id, $0) })
         var result = CleanExecutionResult()
-        var guardCache: [String: ProbeState] = [:]
+        // group by rule so probes are re-captured right before each rule's deletions —
+        // a guard that turned "running" after the scan must still block its items
+        var order: [String] = []
+        var byRule: [String: [CleanItem]] = [:]
         for item in items {
-            if let rule = lookup[item.ruleID], let g = rule.whenNotRunning {
-                let state = guardCache[rule.id] ?? probes.processes.state(bundleIDs: g.bundleIDs, names: g.names)
-                guardCache[rule.id] = state
+            if byRule[item.ruleID] == nil { order.append(item.ruleID) }
+            byRule[item.ruleID, default: []].append(item)
+        }
+        for ruleID in order {
+            let probes = captureProbes()
+            if let g = lookup[ruleID]?.whenNotRunning {
+                let state = probes.processes.state(bundleIDs: g.bundleIDs, names: g.names)
                 if state != .notRunning {
-                    result.skipped.append((item.path, state == .running ? Refusal.processRunning.rawValue
-                                                                          : Refusal.processUnknown.rawValue))
+                    let reason = state == .running ? Refusal.processRunning : Refusal.processUnknown
+                    for item in byRule[ruleID] ?? [] {
+                        result.skipped.append((item.path, reason.rawValue))
+                    }
                     continue
                 }
             }
-            switch deleter.remove(item.path, expected: item.identity, dryRun: false, probes: probes) {
-            case .removed(let size):
-                result.removedBytes += size.bytes
-                result.removedCount += 1
-            case .missing:
-                break
-            case .skipped(let r):
-                result.skipped.append((item.path, r.rawValue))
-            case .failed(let message):
-                result.failed.append((item.path, message))
-            case .wouldRemove:
-                break
+            for item in byRule[ruleID] ?? [] {
+                // the scan already sized each item; re-sizing gets only a short deadline
+                switch deleter.remove(item.path, expected: item.identity, dryRun: false,
+                                      probes: probes, sizeDeadline: Date().addingTimeInterval(3)) {
+                case .removed(let size):
+                    result.removedBytes += size.bytes
+                    result.removedCount += 1
+                case .missing:
+                    break
+                case .skipped(let r):
+                    result.skipped.append((item.path, r.rawValue))
+                case .failed(let message):
+                    result.failed.append((item.path, message))
+                case .wouldRemove:
+                    break
+                }
             }
         }
         return result
@@ -151,8 +167,12 @@ public struct CleanEngine: Sendable {
     func candidates(for rule: CleanRule) -> [String] {
         var out: [String] = []
         let minAge = rule.minAgeDays.map { Date().addingTimeInterval(-$0 * 86_400) }
+        // unguarded parent rules must not claim a dir a guarded rule targets —
+        // ~/Library/Logs/* must leave CoreSimulator to the Simulator-guarded rule
+        let guarded = rule.whenNotRunning == nil ? guardedTargets() : []
         for pattern in rule.patterns {
             for path in Self.expand(Whitelist.expand(pattern, home: home)) {
+                if guarded.contains(where: { $0 == path || $0.hasPrefix(path + "/") }) { continue }
                 let name = (path as NSString).lastPathComponent
                 if rule.excludeNames.contains(name) { continue }
                 if let minAge, let mtime = FileStat.modificationDate(path), mtime > minAge { continue }
@@ -161,6 +181,21 @@ public struct CleanEngine: Sendable {
             }
         }
         return out
+    }
+
+    /// Literal (pre-glob) prefixes of guarded rules' patterns — the dirs they own.
+    private func guardedTargets() -> [String] {
+        rules.filter { $0.whenNotRunning != nil }.flatMap { rule in
+            rule.patterns.map { pattern in
+                let expanded = Whitelist.expand(pattern, home: home)
+                var prefix = ""
+                for component in expanded.split(separator: "/") {
+                    if Glob.hasMeta(String(component)) { break }
+                    prefix += "/" + component
+                }
+                return prefix.isEmpty ? expanded : prefix
+            }
+        }
     }
 
     private func isProtectedContainerOwner(_ path: String) -> Bool {

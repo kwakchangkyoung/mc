@@ -167,6 +167,79 @@ private final class Recorder: @unchecked Sendable {
         #expect(FileStat.exists(prefs + "/com.example.ok.plist"))
     }
 
+    @Test func lintTimeoutCountsAsSkippedNotDeleted() throws {
+        // S3: a plutil timeout is not proof of corruption — keep the file
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let prefs = home + "/Library/Preferences"
+        try touch(prefs + "/com.example.maybe.plist", Data("{".utf8))
+        let engine = makeEngine(home: home) { e, _, _ in
+            if e.hasSuffix("plutil") { return .init(status: 124, stdout: "", timedOut: true) }
+            return .init(status: 0, stdout: "", timedOut: false)
+        }
+        let outcome = engine.run(.fixBrokenConfigs, dryRun: false, probes: idleProbes)
+        #expect(outcome.kind != .applied)
+        #expect(FileStat.exists(prefs + "/com.example.maybe.plist"))
+    }
+
+    @Test func sharedFileListLintTimeoutKeepsFile() throws {
+        // S3: same timeout rule for the shared-file-list repair pass
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let dir = home + "/Library/Application Support/com.apple.sharedfilelist"
+        try touch(dir + "/com.apple.LSSharedFileList.ApplicationRecentServers.sfl2",
+                  Data("{".utf8))
+        let engine = makeEngine(home: home) { e, _, _ in
+            if e.hasSuffix("plutil") { return .init(status: 124, stdout: "", timedOut: true) }
+            return .init(status: 0, stdout: "", timedOut: false)
+        }
+        let outcome = engine.run(.sharedFileListRepair, dryRun: false, probes: idleProbes)
+        #expect(outcome.kind != .applied)
+        #expect(FileStat.exists(dir + "/com.apple.LSSharedFileList.ApplicationRecentServers.sfl2"))
+    }
+
+    @Test func spotlightOrphanKeepsRuleOnMdfindError() throws {
+        // S2: orphan only on a clean empty result; mdfind timeout/error keeps the rule
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let export = String(decoding: try PropertyListSerialization.data(
+            fromPropertyList: ["EnabledPreferenceRules": ["com.example.ghost"]],
+            format: .xml, options: 0), as: UTF8.self)
+        let engine = makeEngine(home: home) { e, a, _ in
+            if e.hasSuffix("defaults"), a.first == "export" {
+                return .init(status: 0, stdout: export, timedOut: false)
+            }
+            if e.hasSuffix("mdfind") { return .init(status: 124, stdout: "", timedOut: true) }
+            return .init(status: 0, stdout: "", timedOut: false)
+        }
+        let outcome = engine.run(.spotlightOrphanRulesCleanup, dryRun: false, probes: idleProbes)
+        #expect(outcome.kind == .unchanged)
+    }
+
+    @Test func sqliteBusyTimeoutAndSeparateVacuumResult() throws {
+        // O2: every sqlite3 call sets .timeout; a VACUUM failure does not undo a good DELETE
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let db = home + "/Library/Application Support/Knowledge/knowledgeC.db"
+        try mkdir((db as NSString).deletingLastPathComponent)
+        FileManager.default.createFile(atPath: db, contents: nil)
+        let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: db))
+        try handle.truncate(atOffset: 101 * 1024 * 1024)   // ≥100MB, sparse
+        try handle.close()
+
+        let recorder = Recorder()
+        let engine = makeEngine(home: home) { e, a, _ in
+            recorder.calls.append((e, a))
+            if a.last == "VACUUM;" { return .init(status: 1, stdout: "", timedOut: false) }
+            return .init(status: 0, stdout: "", timedOut: false)
+        }
+        let outcome = engine.run(.coreduetCleanup, dryRun: false, probes: idleProbes)
+        #expect(outcome.kind == .applied)
+        let sqlCalls = recorder.calls.filter { $0.0 == "/usr/bin/sqlite3" }.map(\.1)
+        #expect(sqlCalls.allSatisfy { Array($0.prefix(2)) == ["-cmd", ".timeout 5000"] })
+        #expect(sqlCalls.contains { $0.last == "VACUUM;" })
+    }
+
     @Test func launchAgentsCleanupReportsOnlyMissingPrograms() throws {
         let home = try makeTempDir()
         defer { try? FileManager.default.removeItem(atPath: home) }
@@ -258,7 +331,7 @@ private final class Recorder: @unchecked Sendable {
         }
         let outcome = engine.run(.sqliteVacuum, dryRun: false, probes: idleProbes)
         #expect(outcome.kind == .applied)
-        let dbCalls = recorder.calls.compactMap { $0.1.first }
+        let dbCalls = recorder.calls.compactMap { $0.1.dropFirst(2).first }
         #expect(!dbCalls.contains { $0.contains("/Library/Mail/") })
         #expect(dbCalls.contains(safariDB))
     }
@@ -296,5 +369,33 @@ private final class Recorder: @unchecked Sendable {
                                            message: "x").kind == .skipped)
         #expect(OptimizeOutcome.fromCounts(.cacheRefresh, applied: 0, failed: 0, skipped: 0,
                                            message: "x").kind == .unchanged)
+    }
+}
+
+@Suite struct OptimizeDiagnosticsTests {
+    @Test(arguments: [
+        ("430:54.21", 25_854),   // mmm:ss.cc — fractional part must not flip the unit
+        ("00:05.50", 5),
+        ("1:02:03", 3_723),
+        ("2-03:04:05", 183_845),
+        ("0:59.99", 59),
+    ])
+    func parseClock(input: String, expected: Int) {
+        #expect(OptimizeDiagnostics.parseClock(input) == expected)
+    }
+
+    @Test func runawayDetectionUsesBasenameAndFractionalTime() throws {
+        // O1: `ps -Aco` basenames may contain spaces; `430:54.21` must read as ~7.2h not 430s
+        let shell: OptimizeEngine.Runner = { _, a, _ in
+            if a == ["-Aco", "pid=,time=,etime=,comm="] {
+                return .init(status: 0, stdout:
+                    "  100 50000:30.50 2-00:00:00 My App\n  200 43000:00.00 1-00:00:00 WindowServer\n",
+                    timedOut: false)
+            }
+            return .init(status: 0, stdout: "", timedOut: false)
+        }
+        let findings = OptimizeDiagnostics.run(shell: shell)
+        #expect(findings.contains { $0.contains("My App") })
+        #expect(!findings.contains { $0.contains("WindowServer") })
     }
 }

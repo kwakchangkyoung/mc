@@ -13,6 +13,7 @@ final class OptimizeModel: ObservableObject {
     var selectedCount: Int { selected.count }
 
     func diagnose() {
+        guard !diagnosing else { return }
         diagnosing = true
         Task {
             diagnostics = await Task.detached(priority: .userInitiated) {
@@ -84,7 +85,7 @@ struct OptimizeView: View {
     private func taskRow(_ task: OptimizeTask) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Toggle("", isOn: Binding(
+                Toggle(task.title, isOn: Binding(
                     get: { model.selected.contains(task) },
                     set: { isOn in
                         if isOn { model.selected.insert(task) } else { model.selected.remove(task) }

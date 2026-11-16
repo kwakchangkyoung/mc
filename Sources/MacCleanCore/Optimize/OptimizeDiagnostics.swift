@@ -68,9 +68,10 @@ public enum OptimizeDiagnostics {
         }
 
         // runaway processes: elapsed >12h and CPU time ≥25% of elapsed
-        let psOut = shell("/bin/ps", ["-Ao", "pid=,time=,etime=,comm="], 5).stdout
-        for line in psOut.split(whereSeparator: \.isNewline).prefix(400) {
-            let cols = line.split(separator: " ", omittingEmptySubsequences: true)
+        // -c → comm is the basename (may still contain spaces → maxSplits, not ==4)
+        let psOut = shell("/bin/ps", ["-Aco", "pid=,time=,etime=,comm="], 5).stdout
+        for line in psOut.split(whereSeparator: \.isNewline) {
+            let cols = line.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
             guard cols.count == 4, let pid = cols.first,
                   let cpu = parseClock(String(cols[1])),
                   let elapsed = parseClock(String(cols[2])),
@@ -134,8 +135,8 @@ public enum OptimizeDiagnostics {
             .map { "\(ByteFormat.string($0.0 * 1024)) \($0.1)" }
     }
 
-    /// `[[dd-]hh:]mm:ss` → seconds.
-    private static func parseClock(_ s: String) -> Int? {
+    /// `[[dd-]hh:]mm:ss[.cc]` → seconds (fraction truncated — `ps time=` is mmm:ss.cc).
+    static func parseClock(_ s: String) -> Int? {
         var days = 0
         var rest = s
         if let dash = s.firstIndex(of: "-") {
@@ -143,11 +144,19 @@ public enum OptimizeDiagnostics {
             days = d
             rest = String(s[s.index(after: dash)...])
         }
-        let parts = rest.split(separator: ":").compactMap { Int($0) }
+        let parts = rest.split(separator: ":")
         guard !parts.isEmpty else { return nil }
-        var seconds = 0
-        for p in parts { seconds = seconds * 60 + p }
-        return days * 86_400 + seconds
+        var seconds = 0.0
+        for (i, p) in parts.enumerated() {
+            if i == parts.count - 1 {
+                guard let v = Double(p) else { return nil }
+                seconds = seconds * 60 + v
+            } else {
+                guard let v = Int(p) else { return nil }
+                seconds = seconds * 60 + Double(v)
+            }
+        }
+        return days * 86_400 + Int(seconds)
     }
 
     private static func match(_ pattern: String, in text: String) -> String? {

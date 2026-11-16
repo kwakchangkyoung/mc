@@ -23,21 +23,29 @@ public struct OpenFilesSnapshot: Sendable {
         for pid in pids.prefix(Int(filled)) where pid > 0 && pid != selfPid {
             var bsd = proc_bsdinfo()
             let infoSize = Int32(MemoryLayout<proc_bsdinfo>.size)
+            errno = 0
             guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsd, infoSize) == infoSize else {
-                if errno != ESRCH && errno != EPERM { complete = false }
+                if !Self.isBenignProbeError(errno) { complete = false }
                 continue
             }
             guard bsd.pbi_uid == uid else { continue }
 
+            errno = 0
             let fdBytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
             guard fdBytes > 0 else {
-                if fdBytes < 0 && errno != ESRCH { complete = false }
+                // proc_pidinfo reports failure as 0 (not <0); a zero result on one of our
+                // own processes is a probe failure, not "no fds"
+                if !Self.isBenignProbeError(errno) { complete = false }
                 continue
             }
             let fdCount = Int(fdBytes) / MemoryLayout<proc_fdinfo>.size
             var fds = [proc_fdinfo](repeating: proc_fdinfo(), count: fdCount + 16)
+            errno = 0
             let got = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, &fds, Int32(fds.count * MemoryLayout<proc_fdinfo>.size))
-            guard got > 0 else { continue }
+            guard got > 0 else {
+                if !Self.isBenignProbeError(errno) { complete = false }
+                continue
+            }
             let n = Int(got) / MemoryLayout<proc_fdinfo>.size
             for fd in fds.prefix(n) where fd.proc_fdtype == UInt32(PROX_FDTYPE_VNODE) {
                 var vinfo = vnode_fdinfowithpath()
@@ -50,6 +58,12 @@ public struct OpenFilesSnapshot: Sendable {
             }
         }
         return OpenFilesSnapshot(paths: result, complete: complete)
+    }
+
+    /// Probe failures that do not make the snapshot incomplete: the process is gone
+    /// (ESRCH) or belongs to another user and cannot be inspected (EPERM).
+    static func isBenignProbeError(_ code: Int32) -> Bool {
+        code == ESRCH || code == EPERM
     }
 
     /// Is any file at `path` (or below it, for a directory) open?

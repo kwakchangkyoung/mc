@@ -7,7 +7,7 @@ final class UninstallModel: ObservableObject {
 
     @Published var phase: Phase = .list
     @Published var apps: [InstalledApp] = []
-    /// Bundle ids whose size measurement is still in flight.
+    /// App paths whose size measurement is still in flight.
     @Published var sizingPending: Set<String> = []
     @Published var query = ""
     @Published var plan: UninstallPlan?
@@ -15,8 +15,15 @@ final class UninstallModel: ObservableObject {
     @Published var execution: UninstallResult?
     @Published var error: String?
 
-    /// Bumps on every loadApps so late size results can't write into a newer list.
-    private var loadToken = 0
+    /// Bumps on every loadApps so a stale sizing pass stops early and late
+    /// results can't write into a newer list. Sendable: read from worker threads.
+    private final class SizingGeneration: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+        func bump() -> Int { lock.withLock { value += 1; return value } }
+        func isCurrent(_ generation: Int) -> Bool { lock.withLock { generation == value } }
+    }
+    private let sizingGeneration = SizingGeneration()
 
     var filtered: [InstalledApp] {
         let q = query.trimmingCharacters(in: .whitespaces).lowercased()
@@ -33,8 +40,7 @@ final class UninstallModel: ObservableObject {
     func loadApps() {
         phase = .loading
         error = nil
-        loadToken += 1
-        let token = loadToken
+        let token = sizingGeneration.bump()
         Task {
             // discovery only: the list appears first, bundle sizes fill in as measured
             let found = await Task.detached(priority: .userInitiated) { () -> [InstalledApp] in
@@ -42,16 +48,18 @@ final class UninstallModel: ObservableObject {
                 return AppInventory(home: AppEnvironment.current.home)
                     .discover(protection: deleter.policy.protection)
             }.value
-            guard token == loadToken else { return }
+            guard sizingGeneration.isCurrent(token) else { return }
             apps = found
             sizingPending = Set(found.map(\.path))
             phase = .list
+            let generation = sizingGeneration
             Task.detached(priority: .utility) {
                 let deadline = Date().addingTimeInterval(30)
                 DispatchQueue.concurrentPerform(iterations: found.count) { i in
+                    guard generation.isCurrent(token) else { return }
                     let size = SizeCalculator.allocatedSize(of: found[i].path, deadline: deadline)
                     Task { @MainActor in
-                        guard token == self.loadToken,
+                        guard generation.isCurrent(token),
                               i < self.apps.count, self.apps[i].path == found[i].path
                         else { return }
                         self.apps[i].size = size
@@ -122,7 +130,9 @@ final class UninstallModel: ObservableObject {
     func back() {
         plan = nil
         execution = nil
-        loadApps()
+        // reuse the loaded list — sizes already measured keep showing, and any
+        // sizing still in flight continues to fill in
+        phase = .list
     }
 }
 
@@ -142,7 +152,7 @@ struct UninstallView: View {
             Button("휴지통으로 이동", role: .destructive) { model.uninstall() }
             Button("취소", role: .cancel) {}
         } message: {
-            Text("앱 번들과 \(model.selectedItems.count)개 관련 파일(\(bytes(model.selectedBytes)))이 이동됩니다. 이동 전에 안전 검사를 다시 수행합니다.")
+            Text("앱 번들과 \(model.selectedItems.filter { $0.path != model.plan?.bundleItem.path }.count)개 관련 파일(\(bytes(model.selectedBytes)))이 이동됩니다. 이동 전에 안전 검사를 다시 수행합니다.")
         }
     }
 
@@ -214,6 +224,7 @@ struct UninstallView: View {
         VStack(spacing: 0) {
             HStack {
                 Button { model.back() } label: { Image(systemName: "chevron.left") }
+                    .accessibilityLabel("뒤로")
                 VStack(alignment: .leading, spacing: 1) {
                     Text(plan.app.name).font(.headline)
                     Text("\(plan.app.bundleID) · \(plan.app.path)")
@@ -253,7 +264,7 @@ struct UninstallView: View {
             if item.requiresAdmin {
                 Image(systemName: "lock").foregroundStyle(.secondary).frame(width: 18)
             } else {
-                Toggle("", isOn: Binding(
+                Toggle(item.path, isOn: Binding(
                     get: { fixed || model.selected.contains(item.path) },
                     set: { isOn in
                         if isOn { model.selected.insert(item.path) } else { model.selected.remove(item.path) }

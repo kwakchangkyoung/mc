@@ -101,6 +101,24 @@ private func makeTempDir() throws -> String {
         #expect(policy.validate(link, probes: idleProbes) == .symlinkToCritical)
     }
 
+    @Test func uninstallModeRefusesLibraryRoots() throws {
+        // S1 defence in depth: even a normalized candidate equal to a Library root is refused
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let policy = PathPolicy(home: home,
+                                protection: ProtectionPolicy(home: home,
+                                                             ownLogDirectory: home + "/Library/Logs/MacClean"))
+        for root in [home, home + "/Library", home + "/Library/Preferences",
+                     home + "/Library/Preferences/ByHost", home + "/Library/Caches",
+                     home + "/Library/Logs", home + "/Library/Containers",
+                     home + "/Library/Group Containers", home + "/.config", home + "/.cache"] {
+            #expect(policy.validate(root, probes: idleProbes, uninstall: true) != nil,
+                    "root \(root) accepted")
+        }
+        #expect(policy.validate(home + "/Library/Preferences/com.example.Foo.plist",
+                              probes: idleProbes, uninstall: true) == nil)
+    }
+
     @Test func protectData() {
         #expect(protection.shouldProtectData("com.apple.anything"))
         #expect(protection.shouldProtectData("com.bitwarden.desktop"))
@@ -144,6 +162,129 @@ private func makeTempDir() throws -> String {
         #expect(wl.contains("/Users/u/.gradle/caches/modules"))           // descendant of literal
         #expect(wl.contains("/Users/u/a"))                                // ancestor of protected child
         #expect(!wl.contains("/Users/u/Library/Caches/Other"))
+    }
+}
+
+@Suite struct CleanEngineTests {
+    private final class Counter: @unchecked Sendable { var value = 0 }
+
+    private func engine(home: String, rules: [CleanRule] = CleanCatalog.rules) -> CleanEngine {
+        let protection = ProtectionPolicy(home: home, ownLogDirectory: home + "/Library/Logs/MacClean")
+        return CleanEngine(home: home,
+                           deleter: SafeDeleter(policy: PathPolicy(home: home, protection: protection),
+                                                whitelist: Whitelist(expandedPatterns: []), log: nil),
+                           rules: rules)
+    }
+
+    @Test func guardedChildWinsOverUnguardedParent() throws {
+        // S6: ~/Library/Logs/* must not claim CoreSimulator, which a later guarded rule owns
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        try FileManager.default.createDirectory(
+            atPath: home + "/Library/Logs/CoreSimulator", withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            atPath: home + "/Library/Logs/FooApp", withIntermediateDirectories: true)
+        let rules = [
+            CleanRule(.userEssentials, "logs", ["~/Library/Logs/*"], source: "t"),
+            CleanRule(.developerTools, "sim", ["~/Library/Logs/CoreSimulator/*"], source: "t",
+                      whenNotRunning: RunningGuard(names: ["Simulator"])),
+        ]
+        let unguarded = engine(home: home, rules: rules).candidates(for: rules[0])
+        #expect(unguarded.contains(home + "/Library/Logs/FooApp"))
+        #expect(!unguarded.contains(home + "/Library/Logs/CoreSimulator"))
+    }
+
+    @Test func catalogCachesRuleSkipsGuardedXcode() throws {
+        // S6: same check against the real catalog (Xcode cache rule is guarded)
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        try FileManager.default.createDirectory(
+            atPath: home + "/Library/Caches/com.apple.dt.Xcode", withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            atPath: home + "/Library/Caches/FooApp", withIntermediateDirectories: true)
+        let e = engine(home: home)
+        let rule = try #require(CleanCatalog.rules.first { $0.label == "User app cache" })
+        let candidates = e.candidates(for: rule)
+        #expect(!candidates.contains(home + "/Library/Caches/com.apple.dt.Xcode"))
+        #expect(candidates.contains(home + "/Library/Caches/FooApp"))
+    }
+
+    @Test func executeRecapturesProbesPerRule() throws {
+        // S7: fresh probe state per rule group, not one snapshot for the whole run
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let f1 = home + "/Library/Logs/a.log"
+        let f2 = home + "/Library/Caches/b.bin"
+        for f in [f1, f2] {
+            try FileManager.default.createDirectory(
+                atPath: (f as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            try Data(count: 8).write(to: URL(fileURLWithPath: f))
+        }
+        let rules = [
+            CleanRule(.userEssentials, "r1", ["~/Library/Logs/*"], source: "t"),
+            CleanRule(.appCaches, "r2", ["~/Library/Caches/*"], source: "t"),
+        ]
+        var e = engine(home: home, rules: rules)
+        let counter = Counter()
+        e.captureProbes = { counter.value += 1; return idleProbes }
+        let items = [f1, f2].enumerated().map { i, f in
+            CleanItem(path: f, ruleID: rules[i].id, size: .zero, identity: PathIdentity.capture(f))
+        }
+        _ = e.execute(items)
+        #expect(counter.value == 2)
+    }
+
+    @Test func guardedRuleReprobedBeforeDelete() throws {
+        // S7: a guard that turns "running" after the scan must still block its items
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let f = home + "/Library/Caches/target.bin"
+        try FileManager.default.createDirectory(
+            atPath: (f as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        try Data(count: 8).write(to: URL(fileURLWithPath: f))
+        let rules = [CleanRule(.developerTools, "sim", ["~/Library/Caches/*"], source: "t",
+                               whenNotRunning: RunningGuard(names: ["Simulator"]))]
+        var e = engine(home: home, rules: rules)
+        e.captureProbes = {
+            ProbeContext(processes: ProcessSnapshot(
+                entries: [ProcessSnapshot.Entry(pid: 1, name: "Simulator",
+                                              path: "/x/Simulator", arguments: "")],
+                bundleIDs: [], complete: true),
+            openFiles: OpenFilesSnapshot(paths: [], complete: true))
+        }
+        let item = CleanItem(path: f, ruleID: rules[0].id, size: .zero,
+                             identity: PathIdentity.capture(f))
+        let result = e.execute([item])
+        #expect(result.skipped.map(\.path) == [f])
+        #expect(FileStat.exists(f))
+    }
+}
+
+@Suite struct ProbeAndShellTests {
+    @Test func openFilesOnlyBenignErrnos() {
+        // S8: ESRCH (process gone) / EPERM (other user) are the only tolerable probe failures
+        #expect(OpenFilesSnapshot.isBenignProbeError(ESRCH))
+        #expect(OpenFilesSnapshot.isBenignProbeError(EPERM))
+        #expect(!OpenFilesSnapshot.isBenignProbeError(EIO))
+        #expect(!OpenFilesSnapshot.isBenignProbeError(0))
+    }
+
+    @Test func cpuTickDeltaSurvivesCounterWrap() {
+        // O4: subtract wrapped UInt32 counters before widening
+        #expect(CPUSampler.tickDelta(5, UInt32.max - 3) == 9)
+        #expect(CPUSampler.tickDelta(10, 3) == 7)
+    }
+
+    @Test func timeoutKillsStubbornProcess() async throws {
+        // O5: SIGTERM is ignored → SIGKILL must reap the child before its marker appears
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let marker = dir + "/survived"
+        let r = Shell.run("/bin/sh", ["-c", "trap '' TERM; sleep 3; touch '\(marker)'"],
+                          timeout: 0.3)
+        #expect(r.timedOut)
+        try await Task.sleep(nanoseconds: 4_000_000_000)
+        #expect(!FileStat.exists(marker))
     }
 }
 

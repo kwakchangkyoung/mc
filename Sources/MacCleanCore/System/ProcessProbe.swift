@@ -37,6 +37,7 @@ public struct ProcessSnapshot: Sendable {
         guard filled > 0 else { return ProcessSnapshot(entries: [], bundleIDs: bundleIDs, complete: false) }
 
         var entries: [Entry] = []
+        var complete = true
         var pathBuf = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
         for pid in pids.prefix(Int(filled)) where pid > 0 {
             var path = ""
@@ -48,9 +49,24 @@ public struct ProcessSnapshot: Sendable {
                 var nameBuf = [CChar](repeating: 0, count: 256)
                 if proc_name(pid, &nameBuf, UInt32(nameBuf.count)) > 0 { name = String(cString: nameBuf) }
             }
+            // a live same-user process whose executable cannot be resolved at all is a
+            // probe failure (other users' pids return EPERM from kill and are tolerated;
+            // zombies have no executable by definition, so they must not count)
+            if name.isEmpty && path.isEmpty && kill(pid, 0) == 0 && !Self.isZombie(pid) {
+                complete = false
+            }
             entries.append(Entry(pid: pid, name: name, path: path, arguments: Self.arguments(of: pid)))
         }
-        return ProcessSnapshot(entries: entries, bundleIDs: bundleIDs, complete: true)
+        return ProcessSnapshot(entries: entries, bundleIDs: bundleIDs, complete: complete)
+    }
+
+    /// SZOMB via KERN_PROC_PID — zombies fail proc_pidpath/proc_name legitimately
+    /// (proc_pidinfo returns nothing for them, so bsdinfo cannot be used here).
+    private static func isZombie(_ pid: pid_t) -> Bool {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        var kp = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.size
+        return sysctl(&mib, 4, &kp, &size, nil, 0) == 0 && kp.kp_proc.p_stat == SZOMB
     }
 
     /// argv via KERN_PROCARGS2 (layout: argc, exec path, NUL padding, argv strings...).

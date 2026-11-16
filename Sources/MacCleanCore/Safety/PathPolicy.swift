@@ -111,6 +111,19 @@ public struct PathPolicy: Sendable {
         return false
     }
 
+    /// Roots an uninstall leftover may never equal (Mole app_protection.sh:1560-1580):
+    /// the Library roots, shared state roots, XDG dirs and $HOME itself.
+    static func uninstallRoots(home: String) -> Set<String> {
+        let lib = home + "/Library"
+        return [
+            home, lib, lib + "/Application Support", lib + "/Caches", lib + "/Logs",
+            lib + "/Preferences", lib + "/Preferences/ByHost", lib + "/Containers",
+            lib + "/WebKit", lib + "/HTTPStorages", lib + "/Application Scripts",
+            lib + "/Autosave Information", lib + "/Group Containers",
+            home + "/.config", home + "/.cache", home + "/.local/share",
+        ]
+    }
+
     private static let privateAllowPatterns = [
         "/private/tmp/*", "/private/var/tmp/*", "/private/var/log", "/private/var/log/*", "/private/var/folders/*",
         "/private/var/db/diagnostics", "/private/var/db/diagnostics/*",
@@ -132,6 +145,9 @@ public struct PathPolicy: Sendable {
             return .controlCharacter
         }
         let path = Self.normalize(rawPath)
+
+        // Mole app_protection.sh: a leftover may never BE a Library/shared root itself
+        if uninstall, Self.uninstallRoots(home: home).contains(path) { return .protected }
 
         // leaf symlink: its target must not be critical (only the link itself is ever removed)
         if FileStat.isSymlink(path), let dest = FileStat.readLink(path) {

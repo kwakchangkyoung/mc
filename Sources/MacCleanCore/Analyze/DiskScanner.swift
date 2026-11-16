@@ -154,6 +154,9 @@ private struct BulkEntry {
     var nlink: UInt32 = 1
     var dataLength: Int64 = 0
     var allocSize: Int64 = 0
+    /// DIR_MNTSTATUS_MNTPOINT — getattrlistbulk reports the covering volume's DEVID for
+    /// mount-point dirs, so they need their own flag to stay unwalked
+    var mountPoint = false
     var error = false
 }
 
@@ -409,8 +412,16 @@ public struct DiskScanner: Sendable {
         opened = true
         defer { close(fd) }
 
+        // DEVID lies for mount points (it reports the covering volume): verify the
+        // opened dir is really on the root volume before walking it
+        var fst = stat()
+        if fstat(fd, &fst) == 0, UInt64(UInt32(bitPattern: fst.st_dev)) != rootDev {
+            return true
+        }
+
         while true {
-            let n = getattrlistbulk(fd, &Self.bulkAttrs,
+            var attrs = Self.bulkAttrs
+            let n = getattrlistbulk(fd, &attrs,
                                     buffer.baseAddress, buffer.count, 0)
             if n < 0 {
                 if errno == EINTR { continue }
@@ -465,7 +476,8 @@ public struct DiskScanner: Sendable {
         let childPath = work.path + "/" + entry.name
         switch entry.objtype {
         case 2:                                                 // VDIR
-            let other = UInt64(entry.dev) != rootDev
+            // DEVID reports the covering volume on a mount point — treat as other-device
+            let other = UInt64(entry.dev) != rootDev || entry.mountPoint
             if !other || keepChildren {
                 // the dir's own entry size rides the queue and lands via finish()
                 discovered.append(DirWork(
@@ -547,13 +559,15 @@ public struct DiskScanner: Sendable {
         return followStat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR
     }
 
-    /// Attributes fetched per entry: name + vnode type + ids (common), link count +
-    /// sizes (file). Returned fields follow ascending bit order within each group.
-    private static var bulkAttrs: attrlist = {
+    /// Attributes fetched per entry: name + vnode type + ids + per-entry error (common),
+    /// mount status (dir), link count + sizes (file). Returned fields follow ascending
+    /// bit order within each group; groups arrive common → vol → dir → file → fork.
+    private static let bulkAttrs: attrlist = {
         var al = attrlist()
         al.bitmapcount = u_short(ATTR_BIT_MAP_COUNT)
         al.commonattr = ATTR_CMN_RETURNED_ATTRS | ag(ATTR_CMN_NAME) | ag(ATTR_CMN_DEVID)
-            | ag(ATTR_CMN_OBJTYPE) | ag(ATTR_CMN_FILEID)
+            | ag(ATTR_CMN_OBJTYPE) | ag(ATTR_CMN_FILEID) | ag(ATTR_CMN_ERROR)
+        al.dirattr = ag(ATTR_DIR_MOUNTSTATUS)
         al.fileattr = ag(ATTR_FILE_LINKCOUNT) | ag(ATTR_FILE_ALLOCSIZE)
             | ag(ATTR_FILE_DATALENGTH)
         return al
@@ -571,23 +585,22 @@ public struct DiskScanner: Sendable {
         let len = Int(UnsafeRawPointer(entry).load(as: UInt32.self))
         defer { off += len }
 
+        guard len >= 4 + MemoryLayout<attribute_set_t>.size else { return e }
+
         var aset = attribute_set_t()
         memcpy(&aset, entry + 4, MemoryLayout<attribute_set_t>.size)
-        // ATTR_CMN_ERROR means some attrs failed; the name is usually still
-        // returned, so keep decoding it and let the caller mark the row partial
-        e.error = aset.commonattr & ag(ATTR_CMN_ERROR) != 0
         var p = entry + 4 + MemoryLayout<attribute_set_t>.size
 
+        var nameStart = entry + len
         if aset.commonattr & ag(ATTR_CMN_NAME) != 0 {
             var ref = attrreference_t()
             memcpy(&ref, p, MemoryLayout<attrreference_t>.size)
-            let nb = p + Int(ref.attr_dataoffset)
-            var bytes = UnsafeRawBufferPointer(start: nb, count: Int(ref.attr_length))
+            nameStart = p + Int(ref.attr_dataoffset)
+            var bytes = UnsafeRawBufferPointer(start: nameStart, count: Int(ref.attr_length))
             if bytes.last == 0 { bytes = UnsafeRawBufferPointer(rebasing: bytes.dropLast()) }
             e.name = String(decoding: bytes, as: UTF8.self)
             p += MemoryLayout<attrreference_t>.size
         }
-        if e.error { return e }
         if aset.commonattr & ag(ATTR_CMN_DEVID) != 0 {
             memcpy(&e.dev, p, 4); p += 4
         }
@@ -596,6 +609,11 @@ public struct DiskScanner: Sendable {
         }
         if aset.commonattr & ag(ATTR_CMN_FILEID) != 0 {
             memcpy(&e.ino, p, 8); p += 8
+        }
+        if aset.dirattr & ag(ATTR_DIR_MOUNTSTATUS) != 0 {
+            var flags: UInt32 = 0
+            memcpy(&flags, p, 4); p += 4
+            e.mountPoint = flags & UInt32(DIR_MNTSTATUS_MNTPOINT) != 0
         }
         if aset.fileattr & ag(ATTR_FILE_LINKCOUNT) != 0 {
             memcpy(&e.nlink, p, 4); p += 4
@@ -606,6 +624,18 @@ public struct DiskScanner: Sendable {
         if aset.fileattr & ag(ATTR_FILE_DATALENGTH) != 0 {
             memcpy(&e.dataLength, p, 8); p += 8
         }
+        // ATTR_CMN_ERROR (requested) leaves a u32 error code in the gap between
+        // the last attribute and the name data; the returned-attrs bit is only
+        // set on a real error, so check the bit first and a nonzero code as a
+        // fallback — the name usually survives, letting the caller keep a
+        // zero-size partial row like the old per-entry lstat path did
+        let errBit = aset.commonattr & ag(ATTR_CMN_ERROR) != 0
+        var code: UInt32 = 0
+        if errBit || p + 4 <= nameStart {
+            memcpy(&code, p, 4)
+            p += 4
+        }
+        e.error = errBit || code != 0
         return e
     }
 

@@ -3,6 +3,11 @@ import MacCleanCore
 
 /// Plain-text output for comparing with Mole CLI. Never deletes anything.
 enum HeadlessReport {
+    private static func fail(_ message: String) -> Never {
+        FileHandle.standardError.write(Data((message + "\n").utf8))
+        exit(1)
+    }
+
     static func printStatus(_ s: StatusSnapshot) {
         func gb(_ b: Int64) -> String { String(format: "%.1fGB", Double(b) / 1e9) }
         print("host \(s.hostName) \(s.osVersion) \(s.modelIdentifier) \(s.chip)")
@@ -31,8 +36,7 @@ enum HeadlessReport {
     static func printCleanDryRun() {
         let engine: CleanEngine
         do { engine = try AppEnvironment.current.makeCleanEngine() } catch {
-            print("whitelist unreadable: \(error)")
-            exit(1)
+            fail("whitelist unreadable: \(error)")
         }
         let result = engine.scan()
         for group in result.groups {
@@ -53,8 +57,7 @@ enum HeadlessReport {
     static func printAnalyze(_ path: String) {
         let result: AnalyzeResult
         do { result = try DiskScanner().scan(path) } catch {
-            print("analyze failed: \(error)")
-            exit(1)
+            fail("analyze failed: \(error)")
         }
         for e in result.entries {
             print("\(e.isDir ? "d" : "f") \(ByteFormat.string(e.size, partial: e.partial))\t\(e.itemCount)\t\(e.path)")
@@ -68,8 +71,7 @@ enum HeadlessReport {
     static func printUninstallDryRun(_ query: String) {
         let engine: UninstallEngine
         do { engine = try AppEnvironment.current.makeUninstallEngine() } catch {
-            print("whitelist unreadable: \(error)")
-            exit(1)
+            fail("whitelist unreadable: \(error)")
         }
         let inventory = AppInventory(home: AppEnvironment.current.home)
         var apps = inventory.discover(protection: engine.deleter.policy.protection)
@@ -78,8 +80,7 @@ enum HeadlessReport {
             apps[$0].bundleID.lowercased() == q || apps[$0].name.lowercased().contains(q)
         }
         if matched.isEmpty {
-            print("no installed app matches '\(query)'")
-            exit(1)
+            fail("no installed app matches '\(query)'")
         }
         // only the reported apps need their bundle size measured
         for i in matched { apps[i].size = SizeCalculator.allocatedSize(of: apps[i].path) }
@@ -106,8 +107,7 @@ enum HeadlessReport {
     static func printOptimizeDryRun() {
         let engine: OptimizeEngine
         do { engine = try AppEnvironment.current.makeOptimizeEngine() } catch {
-            print("whitelist unreadable: \(error)")
-            exit(1)
+            fail("whitelist unreadable: \(error)")
         }
         for line in OptimizeDiagnostics.run() { print("D \(line)") }
         let probes = ProbeContext.capture()

@@ -33,12 +33,19 @@ public enum Shell {
             readDone.signal()
         }
         if exited.wait(timeout: .now() + timeout) == .timedOut {
-            process.terminate()
-            _ = exited.wait(timeout: .now() + 1)
+            process.terminate()   // SIGTERM, then SIGKILL after a short grace period
+            if exited.wait(timeout: .now() + 1) == .timedOut {
+                kill(process.processIdentifier, SIGKILL)
+                _ = exited.wait(timeout: .now() + 1)
+            }
             _ = readDone.wait(timeout: .now() + 1)
             return Result(status: 124, stdout: "", timedOut: true)
         }
-        _ = readDone.wait(timeout: .now() + 2)
+        // a readDone timeout means the reader thread may still be writing box.data —
+        // do not touch it
+        if readDone.wait(timeout: .now() + 2) == .timedOut {
+            return Result(status: process.terminationStatus, stdout: "", timedOut: false)
+        }
         return Result(status: process.terminationStatus, stdout: String(decoding: box.data, as: UTF8.self),
                       timedOut: false)
     }

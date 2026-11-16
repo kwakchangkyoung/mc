@@ -123,6 +123,61 @@ private func makeDeleter(home: String) -> SafeDeleter {
         #expect(!found.contains(home + "/.config/claude"))
     }
 
+    @Test func slashAndDotNamesNeverProduceLibraryRoots() throws {
+        // S1: names like "./" make `~/Library/Preferences/./` normalize to the root itself
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let lib = home + "/Library"
+        try mkdir(lib + "/Preferences")
+        try mkdir(lib + "/Caches")
+        try mkdir(lib + "/Application Support")
+        for name in ["./", "/.", "..", "..."] {
+            let found = LeftoverFinder(home: home)
+                .userFiles(bundleID: "", appName: name, executable: nil, appPath: "/tmp/x.app")
+            #expect(found.isEmpty, "name \(name) produced \(found)")
+        }
+    }
+
+    @Test func siblingBundleIDContainerNotClaimed() throws {
+        // U1: com.jetbrains.intellij must not claim Containers/com.jetbrains.intellij.ce
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let lib = home + "/Library"
+        try mkdir(lib + "/Containers/com.jetbrains.intellij")
+        try mkdir(lib + "/Containers/com.jetbrains.intellij.ce")
+        let found = LeftoverFinder(home: home)
+            .userFiles(bundleID: "com.jetbrains.intellij", appName: "IntelliJ",
+                       executable: nil, appPath: "/tmp/IntelliJ.app",
+                       siblingBundleIDs: ["com.jetbrains.intellij.ce"])
+        #expect(found.contains(lib + "/Containers/com.jetbrains.intellij"))
+        #expect(!found.contains(lib + "/Containers/com.jetbrains.intellij.ce"))
+    }
+
+    @Test func diagnosticReportsBoundaryAndSharedRuntime() throws {
+        // U5: prefix must end at a boundary; a shared-runtime executable matches by app name only
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let reports = home + "/Library/Logs/DiagnosticReports"
+        try touch(reports + "/Foo_2024.ips")
+        try touch(reports + "/FooBar_2024.ips")
+        try touch(reports + "/Electron_2024.ips")
+        try touch(reports + "/ElectronHelper_x.ips")
+
+        let found = LeftoverFinder(home: home)
+            .userFiles(bundleID: "com.example.Foo", appName: "Foo", executable: "Electron",
+                       appPath: "/tmp/Foo.app")
+        #expect(found.contains(reports + "/Foo_2024.ips"))
+        #expect(!found.contains(reports + "/FooBar_2024.ips"))
+        #expect(!found.contains(reports + "/Electron_2024.ips"))
+        #expect(!found.contains(reports + "/ElectronHelper_x.ips"))
+
+        // a normal (non-runtime) executable still matches at a boundary
+        let found2 = LeftoverFinder(home: home)
+            .userFiles(bundleID: "com.example.Zed", appName: "Zed", executable: "FooBar",
+                       appPath: "/tmp/Zed.app")
+        #expect(found2.contains(reports + "/FooBar_2024.ips"))
+    }
+
     @Test func launchAgentMatchedByProgramInsideBundle() throws {
         let home = try makeTempDir()
         defer { try? FileManager.default.removeItem(atPath: home) }
@@ -234,6 +289,107 @@ private func makeDeleter(home: String) -> SafeDeleter {
         #expect(throws: UninstallError.processStateUnknown) {
             _ = try engine.execute(app: app, items: [], probes: incomplete)
         }
+    }
+
+    @Test func processInsideBundleCountsAsRunning() throws {
+        // U2: a process whose executable lives inside the .app must block the uninstall
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let appsDir = home + "/Applications"
+        try writeApp(at: appsDir, name: "Foo", bundleID: "com.example.Foo", executable: "FooExec")
+
+        let engine = UninstallEngine(home: home, deleter: makeDeleter(home: home))
+        let appPath = appsDir + "/Foo.app"
+        let app = InstalledApp(path: appPath, name: "Foo",
+                               bundleID: "com.example.Foo", version: nil, executable: "FooExec",
+                               size: .zero, lastUsed: nil,
+                               identity: PathIdentity.capture(appPath),
+                               officialUninstaller: nil)
+        let helperRunning = ProbeContext(
+            processes: ProcessSnapshot(entries: [
+                ProcessSnapshot.Entry(pid: 42, name: "helperd",
+                                      path: appPath + "/Contents/Library/helperd",
+                                      arguments: ""),
+            ], bundleIDs: [], complete: true),
+            openFiles: OpenFilesSnapshot(paths: [], complete: true))
+        #expect(throws: UninstallError.appRunning("Foo")) {
+            _ = try engine.execute(app: app, items: [], probes: helperRunning)
+        }
+    }
+
+    @Test func darwinUserCacheIsUserDomain() throws {
+        // U3: /var/folders/.../C/<bundle id> belongs to the user, not the admin-only list
+        guard let cacheDir = DarwinDirs.userCacheDir() else { return }
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let appsDir = home + "/Applications"
+        try writeApp(at: appsDir, name: "Foo", bundleID: "com.macclean.testFoo", executable: "FooExec")
+        let fixture = cacheDir + "com.macclean.testFoo"
+        try mkdir(fixture)
+        defer { try? FileManager.default.removeItem(atPath: fixture) }
+
+        let engine = UninstallEngine(home: home, deleter: makeDeleter(home: home))
+        let appPath = appsDir + "/Foo.app"
+        let app = InstalledApp(path: appPath, name: "Foo",
+                               bundleID: "com.macclean.testFoo", version: nil, executable: "FooExec",
+                               size: .zero, lastUsed: nil,
+                               identity: PathIdentity.capture(appPath),
+                               officialUninstaller: nil)
+        let plan = engine.plan(for: app, siblings: [], probes: idleProbes)
+        let item = plan.leftovers.first { $0.path == fixture }
+        #expect(item != nil)
+        #expect(item?.requiresAdmin == false)
+    }
+
+    @Test func danglingSymlinkSurvivesDedupe() throws {
+        // U4: stat() fails on a dangling link; lstat() identity must be used instead
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let lib = home + "/Library"
+        try mkdir(lib + "/Caches")
+        try FileManager.default.createSymbolicLink(
+            atPath: lib + "/Caches/com.example.Foo", withDestinationPath: lib + "/gone")
+        try touch(lib + "/Preferences/com.example.Foo.plist")
+
+        let engine = UninstallEngine(home: home, deleter: makeDeleter(home: home))
+        let appsDir = home + "/Applications"
+        try writeApp(at: appsDir, name: "Foo", bundleID: "com.example.Foo", executable: "FooExec")
+        let appPath = appsDir + "/Foo.app"
+        let app = InstalledApp(path: appPath, name: "Foo",
+                               bundleID: "com.example.Foo", version: nil, executable: "FooExec",
+                               size: .zero, lastUsed: nil,
+                               identity: PathIdentity.capture(appPath),
+                               officialUninstaller: nil)
+        let plan = engine.plan(for: app, siblings: [], probes: idleProbes)
+        let paths = plan.leftovers.map(\.path)
+        #expect(paths.contains(lib + "/Caches/com.example.Foo"))
+        #expect(paths.contains(lib + "/Preferences/com.example.Foo.plist"))
+    }
+
+    @Test func symlinkAndTargetBothSurviveDedupe() throws {
+        // U4: a link and its target are different objects; dedupe must not collapse them
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let lib = home + "/Library"
+        try mkdir(lib + "/Logs/com.example.Foo")
+        try mkdir(lib + "/Caches")
+        try FileManager.default.createSymbolicLink(
+            atPath: lib + "/Caches/com.example.Foo",
+            withDestinationPath: lib + "/Logs/com.example.Foo")
+
+        let engine = UninstallEngine(home: home, deleter: makeDeleter(home: home))
+        let appsDir = home + "/Applications"
+        try writeApp(at: appsDir, name: "Foo", bundleID: "com.example.Foo", executable: "FooExec")
+        let appPath = appsDir + "/Foo.app"
+        let app = InstalledApp(path: appPath, name: "Foo",
+                               bundleID: "com.example.Foo", version: nil, executable: "FooExec",
+                               size: .zero, lastUsed: nil,
+                               identity: PathIdentity.capture(appPath),
+                               officialUninstaller: nil)
+        let plan = engine.plan(for: app, siblings: [], probes: idleProbes)
+        let paths = plan.leftovers.map(\.path)
+        #expect(paths.contains(lib + "/Caches/com.example.Foo"))
+        #expect(paths.contains(lib + "/Logs/com.example.Foo"))
     }
 
     @Test func executeRefusesOfficialUninstallerApps() throws {

@@ -6,7 +6,9 @@ struct MacCleanApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        WindowGroup("맥클린") {
+        // one window only — each window owns its models and concurrent
+        // destructive runs must not be possible
+        Window("맥클린", id: "main") {
             RootView()
                 .frame(minWidth: 860, minHeight: 600)
         }
@@ -19,6 +21,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Launched as a bare SwiftPM executable there is no bundle Info.plist; make it a regular app.
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+        // …and it has no bundle icon: use AppIcon.icns from the bundle or next to
+        // the executable when one is there; skip silently otherwise
+        let exeDir = Bundle.main.executableURL?.deletingLastPathComponent()
+        let icns = Bundle.main.path(forResource: "AppIcon", ofType: "icns")
+            ?? exeDir?.appending(path: "../Resources/AppIcon.icns").path
+            ?? exeDir?.appending(path: "AppIcon.icns").path
+        if let icns, let icon = NSImage(contentsOfFile: icns) {
+            NSApp.applicationIconImage = icon
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -69,6 +80,5 @@ struct RootView: View {
             case .settings: SettingsView()
             }
         }
-        .onAppear { status.start() }
     }
 }

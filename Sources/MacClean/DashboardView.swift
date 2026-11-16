@@ -8,16 +8,23 @@ final class StatusModel: ObservableObject {
     private let collector = StatusCollector()
     private var task: Task<Void, Never>?
 
+    /// Poll while the dashboard is visible; `stop` (or deinit of the model)
+    /// ends the loop. self is weak so a closed window's model can't be kept alive.
     func start() {
         guard task == nil else { return }
-        task = Task { [collector] in
-            while !Task.isCancelled {
+        task = Task { [collector, weak self] in
+            while !Task.isCancelled, let self {
                 let s = await Task.detached(priority: .utility) { collector.collect() }.value
                 self.snapshot = s
                 self.ready = true
                 try? await Task.sleep(for: .seconds(1))
             }
         }
+    }
+
+    func stop() {
+        task?.cancel()
+        task = nil
     }
 }
 
@@ -61,6 +68,8 @@ struct DashboardView: View {
             .padding(20)
         }
         .redacted(reason: model.ready ? [] : .placeholder)
+        .onAppear { model.start() }
+        .onDisappear { model.stop() }
     }
 
     private func header(_ s: StatusSnapshot) -> some View {

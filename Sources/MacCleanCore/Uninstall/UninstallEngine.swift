@@ -42,11 +42,16 @@ public struct UninstallEngine: Sendable {
     public let home: String
     public let deleter: SafeDeleter
     public let finder: LeftoverFinder
+    /// User-domain roots besides $HOME: the Darwin per-user cache/temp dirs
+    /// (/var/folders/.../C, .../T) hold per-user app data even though they live outside ~.
+    public let userRoots: [String]
 
-    public init(home: String, deleter: SafeDeleter) {
+    public init(home: String, deleter: SafeDeleter, userRoots: [String]? = nil) {
         self.home = home
         self.deleter = deleter
         self.finder = LeftoverFinder(home: home)
+        self.userRoots = userRoots
+            ?? [DarwinDirs.userCacheDir(), DarwinDirs.userTempDir()].compactMap { $0 }
     }
 
     /// Sibling guard (Mole `uninstall` family ownership): another installed app sharing the
@@ -62,10 +67,13 @@ public struct UninstallEngine: Sendable {
     public func plan(for app: InstalledApp, siblings: [InstalledApp], probes: ProbeContext,
                      sizeDeadline: Date = Date().addingTimeInterval(30)) -> UninstallPlan {
         let allowNames = siblings.isEmpty
+        let siblingIDs = siblings.map(\.bundleID)
         let userPaths = finder.userFiles(bundleID: app.bundleID, appName: app.name,
                                          executable: app.executable, appPath: app.path,
-                                         allowNamePatterns: allowNames)
-        let sysPaths = finder.systemFiles(bundleID: app.bundleID, appName: app.name)
+                                         allowNamePatterns: allowNames,
+                                         siblingBundleIDs: siblingIDs)
+        let sysPaths = finder.systemFiles(bundleID: app.bundleID, appName: app.name,
+                                          siblingBundleIDs: siblingIDs)
 
         var plan = UninstallPlan(app: app,
                                  bundleItem: LeftoverItem(path: app.path, size: app.size,
@@ -73,16 +81,18 @@ public struct UninstallEngine: Sendable {
                                                           requiresAdmin: false, sensitive: false),
                                  leftovers: [], skipped: [])
 
-        // dedupe by resolved dev:inode — case-insensitive FS can surface the same object
-        // under several spellings ("Sourcetree" vs "sourcetree"), like Mole's path dedupe
+        // dedupe by lstat dev:inode — case-insensitive FS can surface the same object
+        // under several spellings ("Sourcetree" vs "sourcetree"), like Mole's path dedupe.
+        // lstat (not stat): a dangling link must not vanish, and a symlink must not
+        // shadow its target
         var seen = Set<FileID>()
         let all = Self.filterNested(Set(userPaths + sysPaths)).filter { p in
-            guard let id = FileStat.statID(p) else { return false }
+            guard let id = FileStat.lstatID(p) else { return false }
             return seen.insert(id).inserted
         }
         var accepted: [String] = []
         for path in all {
-            let admin = !path.hasPrefix(home + "/")
+            let admin = !isUserDomain(path)
             if admin {
                 plan.leftovers.append(LeftoverItem(path: path, size: .zero,
                                                    identity: PathIdentity.capture(path),
@@ -122,6 +132,11 @@ public struct UninstallEngine: Sendable {
         case .unknown: throw UninstallError.processStateUnknown
         case .notRunning: break
         }
+        // a process whose executable lives inside the bundle counts as running too
+        // (helpers/agents the bundle id and main-executable checks miss)
+        if probes.processes.entries.contains(where: {
+            !$0.path.isEmpty && $0.path.hasPrefix(app.path + "/")
+        }) { throw UninstallError.appRunning(app.name) }
 
         var result = UninstallResult()
         for item in items where !item.requiresAdmin {
@@ -144,6 +159,12 @@ public struct UninstallEngine: Sendable {
     }
 
     // MARK: helpers
+
+    /// $HOME and the Darwin per-user dirs are user domain; anything else needs admin rights.
+    func isUserDomain(_ path: String) -> Bool {
+        path.hasPrefix(home + "/")
+            || userRoots.contains { path.hasPrefix($0) }
+    }
 
     /// Mole `mole_filter_nested_paths`: keep only the topmost path of nested candidates.
     static func filterNested(_ paths: Set<String>) -> [String] {

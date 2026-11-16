@@ -82,25 +82,45 @@ public struct LeftoverFinder: Sendable {
         for p in candidates where FileStat.exists(p) { paths.insert(p) }
     }
 
+    /// A name usable in path patterns: no "/", not only dots — otherwise `./` etc. would
+    /// normalize `~/Library/Preferences/./` to the Library root (Mole app_protection.sh).
+    static func isUsableName(_ name: String) -> Bool {
+        !name.contains("/") && name.contains(where: { $0 != "." })
+    }
+
+    /// `path` starts with `prefix` only at a `_`, `-`, `.` boundary (or equals it).
+    static func hasBoundaryPrefix(_ path: String, _ prefix: String) -> Bool {
+        path == prefix || path.hasPrefix(prefix + "_") || path.hasPrefix(prefix + "-")
+            || path.hasPrefix(prefix + ".")
+    }
+
+    /// Executable basenames that are shared runtimes: crash reports for them belong to many
+    /// apps, so only the app name may be used for DiagnosticReports matching.
+    private static let sharedRuntimeNames: Set<String> = [
+        "electron", "java", "node", "python", "python3", "ruby", "perl", "dotnet", "mono",
+        "nwjs", "php",
+    ]
+
     /// `getconf DARWIN_USER_CACHE_DIR` → `/var/folders/.../C/`.
     private func darwinUserCacheDir() -> String? {
-        var buf = [CChar](repeating: 0, count: Int(MAXPATHLEN))
-        // _CS_DARWIN_USER_CACHE_DIR = 65538 (unistd.h, not exported to Swift)
-        guard confstr(65538, &buf, buf.count) > 0 else { return nil }
-        let s = String(cString: buf)
-        return s.hasSuffix("/") ? s : s + "/"
+        DarwinDirs.userCacheDir()
     }
 
     /// User-domain leftovers. `allowNamePatterns=false` when a sibling app shares the bundle id
-    /// or name (Mole family-shared-leaf guard): only bundle-id matches survive.
+    /// or name (Mole family-shared-leaf guard): only bundle-id matches survive. A boundary
+    /// match that is (or is prefixed by) a sibling's bundle id is still excluded.
     public func userFiles(bundleID: String, appName: String, executable: String?,
-                          appPath: String, allowNamePatterns: Bool = true) -> [String] {
+                          appPath: String, allowNamePatterns: Bool = true,
+                          siblingBundleIDs: [String] = []) -> [String] {
         var paths = Set<String>()
         let hasID = Self.isReverseDNS(bundleID)
+        let ownedBySibling: (String) -> Bool = { token in
+            siblingBundleIDs.contains { Self.containsBoundary(token, $0) }
+        }
 
         // MARK: name-based fixed paths
-        if allowNamePatterns, appName.count >= 2 {
-            let variants = Self.nameVariants(appName)
+        if allowNamePatterns, appName.count >= 2, Self.isUsableName(appName) {
+            let variants = Self.nameVariants(appName).filter { Self.isUsableName($0) }
             for n in variants where n.count >= 2 {
                 add(&paths, ["\(lib)/Application Support/\(n)", "\(lib)/Caches/\(n)",
                              "\(lib)/Logs/\(n)", "\(lib)/Preferences/\(n)",
@@ -116,16 +136,20 @@ public struct LeftoverFinder: Sendable {
         }
 
         // MARK: name ≥3 dynamic paths
-        if allowNamePatterns, appName.count >= 3 {
+        if allowNamePatterns, appName.count >= 3, Self.isUsableName(appName) {
             let crash = lib + "/Application Support/CrashReporter"
-            let namePrefixes = Self.nameVariants(appName)
+            let namePrefixes = Self.nameVariants(appName).filter { Self.isUsableName($0) }
             for f in children(crash)
             where f.hasSuffix(".plist") && namePrefixes.contains(where: { f.hasPrefix($0 + "_") }) {
                 add(&paths, [crash + "/" + f])
             }
             let reports = lib + "/Logs/DiagnosticReports"
+            // shared runtimes (Electron etc.) report under their own name for many apps,
+            // so only the app name may match; either way a boundary is required
+            let execShared = executable.map { Self.sharedRuntimeNames.contains($0.lowercased()) } ?? true
+            let reportPrefixes = execShared ? [appName] : [appName, executable].compactMap { $0 }
             for f in children(reports)
-            where f.hasPrefix(appName) || (executable.map { f.hasPrefix($0) } ?? false) {
+            where reportPrefixes.contains(where: { Self.hasBoundaryPrefix(f, $0) }) {
                 add(&paths, [reports + "/" + f])
             }
             // crash/updater framework leaves named after the app
@@ -162,17 +186,20 @@ public struct LeftoverFinder: Sendable {
             ])
             if let cacheDir = darwinUserCacheDir() { add(&paths, [cacheDir + b]) }
 
-            // boundary matches inside container dirs (app-extension ids)
+            // boundary matches inside container dirs (app-extension ids); a match that
+            // belongs to another installed app's bundle id is that app's leftover
             for dir in [lib + "/Group Containers", lib + "/Containers",
                         lib + "/Application Scripts", lib + "/Application Support/FileProvider"] {
-                for child in children(dir) where Self.containsBoundary(child, b) {
+                for child in children(dir)
+                where Self.containsBoundary(child, b) && !ownedBySibling(child) {
                     add(&paths, [dir + "/" + child])
                 }
             }
             // ByHost prefs: `$B.plist` or `$B.*.plist`
             let byHost = lib + "/Preferences/ByHost"
             for f in children(byHost)
-            where f.hasSuffix(".plist") && (f == b + ".plist" || f.hasPrefix(b + ".")) {
+            where f.hasSuffix(".plist") && (f == b + ".plist" || f.hasPrefix(b + "."))
+                && !ownedBySibling((f as NSString).deletingPathExtension) {
                 add(&paths, [byHost + "/" + f])
             }
             // UUID containers whose metadata pins this bundle id
@@ -201,7 +228,8 @@ public struct LeftoverFinder: Sendable {
         let agents = lib + "/LaunchAgents"
         for f in children(agents) where f.hasSuffix(".plist") && !f.hasPrefix("com.apple.") {
             let p = agents + "/" + f
-            if hasID && (f == bundleID + ".plist" || f.hasPrefix(bundleID + ".")) {
+            if hasID && (f == bundleID + ".plist" || f.hasPrefix(bundleID + ".")),
+               !ownedBySibling((f as NSString).deletingPathExtension) {
                 add(&paths, [p])
                 continue
             }
@@ -229,6 +257,11 @@ public struct LeftoverFinder: Sendable {
             }
         }
 
+        // Mole app_protection.sh: a normalized result equal to a Library/shared root is
+        // never a leftover — names like "./" must not trash `~/Library/Preferences` itself
+        let roots = PathPolicy.uninstallRoots(home: home)
+        paths = paths.filter { !roots.contains(($0 as NSString).standardizingPath) }
+
         // independent CLI dotdirs never count as app leftovers
         let cliParents: Set<String> = [home, home + "/.config", home + "/.cache",
                                        home + "/.local/share"]
@@ -245,25 +278,31 @@ public struct LeftoverFinder: Sendable {
     }
 
     /// Review-only /Library matches (Mole `find_app_system_files`). Listed but never deleted.
-    public func systemFiles(bundleID: String, appName: String) -> [String] {
+    public func systemFiles(bundleID: String, appName: String,
+                            siblingBundleIDs: [String] = []) -> [String] {
         var paths = Set<String>()
         let hasID = Self.isReverseDNS(bundleID)
+        let usableName = Self.isUsableName(appName)
 
         for base in ["/Library/Application Support", "/Library/Caches", "/Library/Logs"] {
-            if appName.count >= 2 { add(&paths, [base + "/" + appName]) }
+            if appName.count >= 2, usableName { add(&paths, [base + "/" + appName]) }
             if hasID { add(&paths, [base + "/" + bundleID]) }
         }
-        if appName.count >= 2 {
+        if appName.count >= 2, usableName {
             add(&paths, ["/Library/Preferences/" + appName, "/Library/Preferences/\(appName).plist"])
         }
         if hasID {
             let b = bundleID
+            let ownedBySibling: (String) -> Bool = { token in
+                siblingBundleIDs.contains { Self.containsBoundary(token, $0) }
+            }
             add(&paths, ["/Library/Preferences/\(b).plist",
                          "/Library/LaunchAgents/\(b).plist", "/Library/LaunchDaemons/\(b).plist",
                          "/Library/Receipts/\(b).bom", "/Library/Receipts/\(b).plist"])
             for dir in ["/Library/LaunchAgents", "/Library/LaunchDaemons"] {
                 for f in children(dir)
-                where f.hasSuffix(".plist") && !f.hasPrefix("com.apple.") && f.hasPrefix(b + ".") {
+                where f.hasSuffix(".plist") && !f.hasPrefix("com.apple.") && f.hasPrefix(b + ".")
+                    && !ownedBySibling((f as NSString).deletingPathExtension) {
                     add(&paths, [dir + "/" + f])
                 }
             }
@@ -278,7 +317,7 @@ public struct LeftoverFinder: Sendable {
                 }
             }
         }
-        if appName.count >= 5, !Self.commonWords.contains(appName.lowercased()) {
+        if appName.count >= 5, usableName, !Self.commonWords.contains(appName.lowercased()) {
             for dir in ["/Library/LaunchAgents", "/Library/LaunchDaemons"] {
                 for f in children(dir)
                 where f.hasSuffix(".plist") && !f.hasPrefix("com.apple.") && f.contains(appName) {

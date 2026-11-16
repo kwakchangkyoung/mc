@@ -74,7 +74,7 @@ public struct OptimizeEngine: Sendable {
     }
 
     private func sqlite3(_ path: String, _ sql: String, _ timeout: TimeInterval) -> Shell.Result {
-        shell("/usr/bin/sqlite3", [path, sql], timeout)
+        shell("/usr/bin/sqlite3", ["-cmd", ".timeout 5000", path, sql], timeout)
     }
 
     private var hasSQLite3: Bool { FileStat.exists("/usr/bin/sqlite3") }
@@ -87,11 +87,7 @@ public struct OptimizeEngine: Sendable {
     }
 
     private func darwinUserDir() -> String? {
-        var buf = [CChar](repeating: 0, count: Int(MAXPATHLEN))
-        // _CS_DARWIN_USER_DIR = 65536 (unistd.h, not exported to Swift)
-        guard confstr(65536, &buf, buf.count) > 0 else { return nil }
-        let s = String(cString: buf)
-        return s.hasSuffix("/") ? s : s + "/"
+        DarwinDirs.userDir()
     }
 
     private func fileSize(_ path: String) -> Int64 {
@@ -165,7 +161,9 @@ public struct OptimizeEngine: Sendable {
                 }
                 // 반드시 /usr/bin/plutil (PATH shim 방지)
                 let lint = shell("/usr/bin/plutil", ["-lint", path], 10)
-                if lint.timedOut || lint.status != 0 {
+                if lint.timedOut {
+                    skipped += 1   // 타임아웃은 손상 증거가 아님 — 유지
+                } else if lint.status != 0 {
                     removeOne(path, dryRun: dryRun, probes: probes,
                               removed: &removed, failed: &failed, skipped: &skipped, bytes: &bytes)
                 }
@@ -322,14 +320,14 @@ public struct OptimizeEngine: Sendable {
         }
         // 앱 존재 확인: Spotlight 검색 + 설치 앱 목록 (보수적으로 설치된 것으로 간주)
         let installed = Set(AppInventory(home: home)
-            .scan(protection: deleter.policy.protection).map { $0.bundleID })
+            .discover(protection: deleter.policy.protection).map { $0.bundleID })
         var orphans: [String] = []
         var kept = rules
         for rule in candidates {
-            let found = installed.contains(rule) || {
-                let r = shell("/usr/bin/mdfind", ["kMDItemCFBundleIdentifier == '\(rule)'"], 5)
-                return r.status == 0 && !r.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }()
+            // orphan only on a clean "no results": a mdfind timeout/error keeps the rule
+            let r = shell("/usr/bin/mdfind", ["kMDItemCFBundleIdentifier == '\(rule)'"], 5)
+            let found = installed.contains(rule) || r.timedOut || r.status != 0
+                || !r.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             if found { continue }
             orphans.append(rule)
             kept.removeAll { $0 == rule }
@@ -378,7 +376,9 @@ public struct OptimizeEngine: Sendable {
                   !name.contains("ApplicationRecentDocuments") else { continue }
             let path = dir + "/" + name
             let lint = shell("/usr/bin/plutil", ["-lint", path], 10)
-            if lint.timedOut || lint.status != 0 {
+            if lint.timedOut {
+                skipped += 1   // 타임아웃은 손상 증거가 아님 — 유지
+            } else if lint.status != 0 {
                 removeOne(path, dryRun: dryRun, probes: probes,
                           removed: &removed, failed: &failed, skipped: &skipped, bytes: &bytes)
             }
@@ -490,11 +490,14 @@ public struct OptimizeEngine: Sendable {
         if dryRun {
             return OptimizeOutcome(.quarantineCleanup, .applied, "\(n)개 다운로드 이력 삭제 예정")
         }
-        let r = sqlite3(db, "DELETE FROM LSQuarantineEvent; VACUUM;", 10)
+        let r = sqlite3(db, "DELETE FROM LSQuarantineEvent;", 10)
         if r.status != 0 || r.timedOut {
             return OptimizeOutcome(.quarantineCleanup, .failed, "데이터베이스 잠김 또는 오류")
         }
-        return OptimizeOutcome(.quarantineCleanup, .applied, "\(n)개 다운로드 이력 삭제")
+        // DELETE 성공은 VACUUM 실패와 별개로 보고한다
+        let vacuum = sqlite3(db, "VACUUM;", 10)
+        let note = vacuum.status == 0 && !vacuum.timedOut ? "" : " (VACUUM 실패)"
+        return OptimizeOutcome(.quarantineCleanup, .applied, "\(n)개 다운로드 이력 삭제" + note)
     }
 
     // MARK: 17. launch_agents_cleanup (tasks.sh:1215) — 보고만
@@ -556,15 +559,18 @@ public struct OptimizeEngine: Sendable {
         // 전 행을 삭제하게 됨). coreduet과 같은 방식으로 오프셋을 뺀다.
         let r = sqlite3(db,
                         "DELETE FROM record WHERE delivered_date < "
-                            + "(strftime('%s','now','-30 days') - strftime('%s','2001-01-01')); VACUUM;",
+                            + "(strftime('%s','now','-30 days') - strftime('%s','2001-01-01'));",
                         10)
         if r.status != 0 || r.timedOut {
             return OptimizeOutcome(.notificationCleanup, .failed, "데이터베이스 잠김 또는 오류")
         }
+        // DELETE 성공은 VACUUM 실패와 별개로 보고한다
+        let vacuum = sqlite3(db, "VACUUM;", 10)
+        let note = vacuum.status == 0 && !vacuum.timedOut ? "" : " (VACUUM 실패)"
         // NotificationCenter 재시작 — 실패해도 무시 (launchctl kill, PID kill 금지)
         _ = shell("/bin/launchctl",
                   ["kill", "SIGTERM", "gui/\(getuid())/com.apple.notificationcenterui.agent"], 5)
-        return OptimizeOutcome(.notificationCleanup, .applied, "알림 기록 정리")
+        return OptimizeOutcome(.notificationCleanup, .applied, "알림 기록 정리" + note)
     }
 
     // MARK: 19. coreduet_cleanup (tasks.sh:1544)
@@ -587,11 +593,14 @@ public struct OptimizeEngine: Sendable {
             return OptimizeOutcome(.coreduetCleanup, .applied, "90일 지난 사용 기록 삭제 예정")
         }
         let sql = "DELETE FROM ZOBJECT WHERE ZCREATIONDATE < "
-            + "(strftime('%s','now','-90 days') - strftime('%s','2001-01-01')); VACUUM;"
+            + "(strftime('%s','now','-90 days') - strftime('%s','2001-01-01'));"
         let r = sqlite3(db, sql, 20)
         if r.status != 0 || r.timedOut {
             return OptimizeOutcome(.coreduetCleanup, .failed, "데이터베이스 잠김 또는 오류")
         }
-        return OptimizeOutcome(.coreduetCleanup, .applied, "90일 지난 사용 기록 삭제")
+        // DELETE 성공은 VACUUM 실패와 별개로 보고한다
+        let vacuum = sqlite3(db, "VACUUM;", 20)
+        let note = vacuum.status == 0 && !vacuum.timedOut ? "" : " (VACUUM 실패)"
+        return OptimizeOutcome(.coreduetCleanup, .applied, "90일 지난 사용 기록 삭제" + note)
     }
 }

@@ -26,7 +26,12 @@ enum Sysctl {
 // MARK: CPU
 
 final class CPUSampler {
-    private var previous: [(busy: UInt64, total: UInt64)] = []
+    private var previous: [(busy: UInt32, total: UInt32)] = []
+
+    /// Subtract while still UInt32 so a wrapped counter yields a small delta, then widen.
+    static func tickDelta(_ cur: UInt32, _ prev: UInt32) -> UInt64 {
+        UInt64(cur &- prev)
+    }
 
     func sample() -> CPUMetrics {
         var m = CPUMetrics()
@@ -46,21 +51,21 @@ final class CPUSampler {
             vm_deallocate(mach_task_self_, vm_address_t(bitPattern: info),
                           vm_size_t(Int(infoCount) * MemoryLayout<integer_t>.stride))
         }
-        var current: [(busy: UInt64, total: UInt64)] = []
+        var current: [(busy: UInt32, total: UInt32)] = []
         for i in 0..<Int(cpuCount) {
             let base = Int(CPU_STATE_MAX) * i
-            let user = UInt64(UInt32(bitPattern: info[base + Int(CPU_STATE_USER)]))
-            let system = UInt64(UInt32(bitPattern: info[base + Int(CPU_STATE_SYSTEM)]))
-            let nice = UInt64(UInt32(bitPattern: info[base + Int(CPU_STATE_NICE)]))
-            let idle = UInt64(UInt32(bitPattern: info[base + Int(CPU_STATE_IDLE)]))
-            current.append((user + system + nice, user + system + nice + idle))
+            let user = UInt32(bitPattern: info[base + Int(CPU_STATE_USER)])
+            let system = UInt32(bitPattern: info[base + Int(CPU_STATE_SYSTEM)])
+            let nice = UInt32(bitPattern: info[base + Int(CPU_STATE_NICE)])
+            let idle = UInt32(bitPattern: info[base + Int(CPU_STATE_IDLE)])
+            current.append((user &+ system &+ nice, user &+ system &+ nice &+ idle))
         }
         if previous.count == current.count {
             var busySum: UInt64 = 0
             var totalSum: UInt64 = 0
             m.perCore = zip(current, previous).map { cur, prev in
-                let busy = cur.busy &- prev.busy
-                let total = cur.total &- prev.total
+                let busy = Self.tickDelta(cur.busy, prev.busy)
+                let total = Self.tickDelta(cur.total, prev.total)
                 busySum += busy
                 totalSum += total
                 return total > 0 ? Double(busy) / Double(total) * 100 : 0
@@ -129,8 +134,9 @@ func collectDisks() -> [DiskMetrics] {
         d.name = v.volumeName ?? url.lastPathComponent
         d.mount = url.path
         d.total = total
-        // Mole reports used = total − free without purgeable space; purgeable is shown separately.
-        d.free = raw
+        // Mole computes used = capacity − Finder free, where purgeable space counts as
+        // free; `raw` (truly free) is only used to split purgeable out for display.
+        d.free = important
         d.purgeable = max(important - raw, 0)
         d.isInternal = v.volumeIsInternal ?? true
         result.append(d)

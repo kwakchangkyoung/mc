@@ -62,10 +62,9 @@ public enum CleanCatalog {
 
     /// `getconf DARWIN_USER_CACHE_DIR` (e.g. /var/folders/xx/yy/C), without the trailing slash.
     static let darwinUserCacheDir: String = {
-        var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
-        guard confstr(_CS_DARWIN_USER_CACHE_DIR, &buf, buf.count) > 0 else { return "/nonexistent" }
-        let path = String(cString: buf)
-        return FileStat.realPath(path) ?? path
+        guard let path = DarwinDirs.userCacheDir() else { return "/nonexistent" }
+        let trimmed = path.hasSuffix("/") ? String(path.dropLast()) : path
+        return FileStat.realPath(trimmed) ?? trimmed
     }()
 
     public static let rules: [CleanRule] = [
