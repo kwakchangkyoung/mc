@@ -83,11 +83,7 @@ struct SettingsView: View {
 
                 Section("애플리케이션 정보") {
                     HStack(spacing: 12) {
-                        Image(systemName: "sparkles")
-                            .font(.title2)
-                            .foregroundStyle(.blue)
-                            .frame(width: 36, height: 36)
-                            .background(Color.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        AppLogoView(size: 42)
                         VStack(alignment: .leading, spacing: 3) {
                             HStack(spacing: 6) {
                                 Text("맥클린 (MacClean)")

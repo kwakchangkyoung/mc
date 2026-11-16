@@ -27,7 +27,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let icns = Bundle.main.path(forResource: "AppIcon", ofType: "icns")
             ?? exeDir?.appending(path: "../Resources/AppIcon.icns").path
             ?? exeDir?.appending(path: "AppIcon.icns").path
-        if let icns, let icon = NSImage(contentsOfFile: icns) {
+            ?? exeDir?.appending(path: "Resources/AppIcon.icns").path
+            ?? "Resources/AppIcon.icns"
+        if let icon = NSImage(contentsOfFile: icns) {
             NSApp.applicationIconImage = icon
         }
     }
@@ -135,21 +137,7 @@ struct RootView: View {
 
     private var sidebarBrandHeader: some View {
         HStack(spacing: 10) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [Color(red: 0.25, green: 0.68, blue: 0.98), Color(red: 0.16, green: 0.41, blue: 0.90)],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
-                    .frame(width: 32, height: 32)
-                    .shadow(color: .blue.opacity(0.25), radius: 4, x: 0, y: 2)
-                Image(systemName: "sparkles")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(.white)
-            }
+            AppLogoView(size: 38)
             VStack(alignment: .leading, spacing: 1) {
                 Text("맥클린")
                     .font(.system(size: 14, weight: .bold))
@@ -241,5 +229,62 @@ struct StatusPill: View {
         .padding(.vertical, 3)
         .foregroundStyle(color)
         .background(color.opacity(0.13), in: Capsule())
+    }
+}
+
+struct AppLogoView: View {
+    let size: CGFloat
+
+    private var iconImage: NSImage? {
+        let exeDir = Bundle.main.executableURL?.deletingLastPathComponent()
+        let paths: [String?] = [
+            Bundle.main.path(forResource: "AppIcon", ofType: "icns"),
+            Bundle.main.path(forResource: "AppIcon-preview", ofType: "png"),
+            exeDir?.appending(path: "../Resources/AppIcon.icns").path,
+            exeDir?.appending(path: "../Resources/AppIcon-preview.png").path,
+            exeDir?.appending(path: "AppIcon.icns").path,
+            exeDir?.appending(path: "Resources/AppIcon.icns").path,
+            exeDir?.appending(path: "Resources/AppIcon-preview.png").path,
+            "Resources/AppIcon.icns",
+            "Resources/AppIcon-preview.png",
+            "/Volumes/m2ssd/bak_workspace/mc/Resources/AppIcon.icns",
+            "/Volumes/m2ssd/bak_workspace/mc/Resources/AppIcon-preview.png",
+            "/Volumes/m2ssd/bak_workspace/mc/.worktrees/ui-redesign/Resources/AppIcon.icns",
+            "/Volumes/m2ssd/bak_workspace/mc/.worktrees/ui-redesign/Resources/AppIcon-preview.png",
+        ]
+        for p in paths.compactMap({ $0 }) {
+            if let img = NSImage(contentsOfFile: p), img.isValid {
+                return img
+            }
+        }
+        if let icon = NSImage(named: "AppIcon"), icon.isValid {
+            return icon
+        }
+        return nil
+    }
+
+    var body: some View {
+        if let iconImage {
+            Image(nsImage: iconImage)
+                .resizable()
+                .interpolation(.high)
+                .scaledToFit()
+                .frame(width: size, height: size)
+        } else {
+            ZStack {
+                RoundedRectangle(cornerRadius: size * 0.22, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [Color(red: 0.30, green: 0.74, blue: 0.98), Color(red: 0.16, green: 0.41, blue: 0.90)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                Image(systemName: "sparkles")
+                    .foregroundStyle(.white)
+                    .font(.system(size: size * 0.45))
+            }
+            .frame(width: size, height: size)
+        }
     }
 }
