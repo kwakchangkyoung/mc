@@ -72,15 +72,18 @@ enum HeadlessReport {
             exit(1)
         }
         let inventory = AppInventory(home: AppEnvironment.current.home)
-        let apps = inventory.scan(protection: engine.deleter.policy.protection)
+        var apps = inventory.discover(protection: engine.deleter.policy.protection)
         let q = query.lowercased()
-        let matches = apps.filter {
-            $0.bundleID.lowercased() == q || $0.name.lowercased().contains(q)
+        let matched = apps.indices.filter {
+            apps[$0].bundleID.lowercased() == q || apps[$0].name.lowercased().contains(q)
         }
-        if matches.isEmpty {
+        if matched.isEmpty {
             print("no installed app matches '\(query)'")
             exit(1)
         }
+        // only the reported apps need their bundle size measured
+        for i in matched { apps[i].size = SizeCalculator.allocatedSize(of: apps[i].path) }
+        let matches = matched.map { apps[$0] }
         let probes = ProbeContext.capture()
         for app in matches {
             let plan = engine.plan(for: app,

@@ -7,11 +7,16 @@ final class UninstallModel: ObservableObject {
 
     @Published var phase: Phase = .list
     @Published var apps: [InstalledApp] = []
+    /// Bundle ids whose size measurement is still in flight.
+    @Published var sizingPending: Set<String> = []
     @Published var query = ""
     @Published var plan: UninstallPlan?
     @Published var selected: Set<String> = []
     @Published var execution: UninstallResult?
     @Published var error: String?
+
+    /// Bumps on every loadApps so late size results can't write into a newer list.
+    private var loadToken = 0
 
     var filtered: [InstalledApp] {
         let q = query.trimmingCharacters(in: .whitespaces).lowercased()
@@ -28,14 +33,32 @@ final class UninstallModel: ObservableObject {
     func loadApps() {
         phase = .loading
         error = nil
+        loadToken += 1
+        let token = loadToken
         Task {
+            // discovery only: the list appears first, bundle sizes fill in as measured
             let found = await Task.detached(priority: .userInitiated) { () -> [InstalledApp] in
                 guard let deleter = try? AppEnvironment.current.makeDeleter() else { return [] }
                 return AppInventory(home: AppEnvironment.current.home)
-                    .scan(protection: deleter.policy.protection)
+                    .discover(protection: deleter.policy.protection)
             }.value
+            guard token == loadToken else { return }
             apps = found
+            sizingPending = Set(found.map(\.path))
             phase = .list
+            Task.detached(priority: .utility) {
+                let deadline = Date().addingTimeInterval(30)
+                DispatchQueue.concurrentPerform(iterations: found.count) { i in
+                    let size = SizeCalculator.allocatedSize(of: found[i].path, deadline: deadline)
+                    Task { @MainActor in
+                        guard token == self.loadToken,
+                              i < self.apps.count, self.apps[i].path == found[i].path
+                        else { return }
+                        self.apps[i].size = size
+                        self.sizingPending.remove(found[i].path)
+                    }
+                }
+            }
         }
     }
 
@@ -44,13 +67,16 @@ final class UninstallModel: ObservableObject {
         plan = nil
         execution = nil
         error = nil
+        let all = apps            // reuse the loaded list instead of rescanning
         Task {
             let p = await Task.detached(priority: .userInitiated) { () -> UninstallPlan? in
                 guard let engine = try? AppEnvironment.current.makeUninstallEngine() else { return nil }
-                let inventory = AppInventory(home: AppEnvironment.current.home)
-                let all = inventory.scan(protection: engine.deleter.policy.protection)
-                let siblings = UninstallEngine.siblings(of: app, in: all)
-                return engine.plan(for: app, siblings: siblings, probes: ProbeContext.capture())
+                var target = app
+                if target.size == .zero {
+                    target.size = SizeCalculator.allocatedSize(of: target.path)
+                }
+                let siblings = UninstallEngine.siblings(of: target, in: all)
+                return engine.plan(for: target, siblings: siblings, probes: ProbeContext.capture())
             }.value
             if let p {
                 plan = p
@@ -160,7 +186,8 @@ struct UninstallView: View {
                         }
                         Spacer()
                         Text(lastUsed(app.lastUsed)).font(.caption).foregroundStyle(.secondary)
-                        Text(ByteFormat.string(app.size.bytes, partial: app.size.partial))
+                        Text(model.sizingPending.contains(app.path)
+                             ? "…" : ByteFormat.string(app.size.bytes, partial: app.size.partial))
                             .monospacedDigit().foregroundStyle(.secondary)
                             .frame(width: 84, alignment: .trailing)
                     }

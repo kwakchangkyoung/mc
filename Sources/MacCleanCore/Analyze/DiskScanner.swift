@@ -41,6 +41,85 @@ public struct AnalyzeResult: Sendable {
     public var partial: Bool
     /// true when the scan was cancelled before completion.
     public var cancelled: Bool
+    /// Aggregated per-directory data for instant drill-in; only set by `keepTree` scans.
+    public var tree: AnalyzeNode?
+}
+
+/// A non-directory child kept from a `keepTree` scan (files, symlinks, sockets…).
+public struct ChildFile: Sendable {
+    public let name: String
+    public let size: Int64
+    public let itemCount: Int
+    public let isSymlink: Bool
+    /// true when the entry's attributes could not be fully read.
+    public let partial: Bool
+    /// Scan-time dev:inode of the child and of its parent directory.
+    public let fileID: FileID
+    public let parentID: FileID
+    public var identity: PathIdentity { PathIdentity(parent: parentID, target: fileID) }
+}
+
+/// One directory's aggregated children kept from a `keepTree` scan, for drill-in
+/// without a rescan. Only directories become nodes; files stay as ChildFile records.
+public final class AnalyzeNode: @unchecked Sendable {
+    public let path: String
+    public let name: String
+    /// This entry's size in the parent's listing (own dir entry + subtree).
+    public let size: Int64
+    /// Sum of direct children — the drilled view's TOTAL.
+    public let childrenTotal: Int64
+    public let itemCount: Int
+    public let partial: Bool
+    /// dev:inode bound at scan time; re-checked by SafeDeleter before any move to Trash.
+    public let identity: PathIdentity
+    /// Different volume / firmlink: children were never walked, so drill-in rescans.
+    public let isOtherDevice: Bool
+    /// false under folded dirs: file counts and large files were not collected there,
+    /// so drill-in rescans for full detail like the pre-cached behavior did.
+    public let collected: Bool
+    /// Subdirectory nodes (drillable).
+    public let dirs: [AnalyzeNode]
+    let files: [ChildFile]
+    /// Top large-file candidates inside this subtree (same selection as a rescan).
+    let topFiles: [LargeFile]
+
+    init(path: String, name: String, size: Int64, childrenTotal: Int64, itemCount: Int,
+         partial: Bool, identity: PathIdentity, isOtherDevice: Bool, collected: Bool,
+         dirs: [AnalyzeNode], files: [ChildFile], topFiles: [LargeFile]) {
+        self.path = path; self.name = name; self.size = size
+        self.childrenTotal = childrenTotal; self.itemCount = itemCount
+        self.partial = partial; self.identity = identity; self.isOtherDevice = isOtherDevice
+        self.collected = collected
+        self.dirs = dirs; self.files = files; self.topFiles = topFiles
+    }
+
+    /// The node's own display row in a parent listing.
+    public var entry: AnalyzeEntry {
+        AnalyzeEntry(name: name, path: path, size: size, isDir: true, isSymlink: false,
+                     itemCount: itemCount, partial: partial, identity: identity)
+    }
+
+    /// Direct children as display rows, sorted like `AnalyzeResult.entries`.
+    public func childEntries() -> [AnalyzeEntry] {
+        var rows = dirs.map(\.entry)
+        rows += files.map {
+            // a symlink whose target is a directory is drillable, matching a fresh scan
+            let p = path + "/" + $0.name
+            return AnalyzeEntry(name: $0.name, path: p, size: $0.size,
+                                isDir: $0.isSymlink && DiskScanner.isDirTarget(p),
+                                isSymlink: $0.isSymlink, itemCount: $0.itemCount,
+                                partial: $0.partial, identity: $0.identity)
+        }
+        rows.sort { $0.size != $1.size ? $0.size > $1.size : $0.path < $1.path }
+        return rows
+    }
+
+    /// Result-shaped snapshot for this node (drilled view).
+    public func asResult() -> AnalyzeResult {
+        AnalyzeResult(root: path, entries: childEntries(), largeFiles: topFiles,
+                      totalSize: childrenTotal, totalFiles: itemCount,
+                      partial: partial, cancelled: false, tree: self)
+    }
 }
 
 public enum AnalyzeError: Error, Equatable {
@@ -65,16 +144,90 @@ private final class SeenLinks: @unchecked Sendable {
     func insert(_ id: FileID) -> Bool { lock.withLock { set.insert(id).inserted } }
 }
 
-/// Directory analyzer (Mole `mo analyze`, scanner.go). For a directory it returns its direct
-/// children with their recursive allocated size, plus a top-N large-file list. Symlinks are
-/// never followed, hard links count once per scan, only the root's volume is walked, and
-/// children are measured in parallel. No on-disk cache.
+/// One directory entry returned by getattrlistbulk.
+private struct BulkEntry {
+    var name = ""
+    var dev: UInt32 = 0
+    var ino: UInt64 = 0
+    /// vnode type: VREG=1, VDIR=2, VLNK=5; other values count as "other".
+    var objtype: UInt32 = 0
+    var nlink: UInt32 = 1
+    var dataLength: Int64 = 0
+    var allocSize: Int64 = 0
+    var error = false
+}
+
+/// One directory's walk accumulators. Written only by the worker owning the read and
+/// published under the shared lock, so no lock is needed inside the entry loop.
+private struct Accum {
+    var agg: Int64 = 0
+    var count = 0
+    var partial = false
+    var files: [ChildFile] = []
+    var candidates: [LargeFile] = []
+    var seen = 0
+    var cancelled = false
+}
+
+/// A directory queued for (or in the middle of) a parallel walk.
+private final class DirWork {
+    let path: String
+    let name: String
+    /// This dir's own dev:inode — also the parent FileID of its children.
+    let dirID: FileID
+    /// actualSize of the dir entry itself, taken from the parent's bulk read.
+    let ownEntry: Int64
+    /// Large-file collection on (false under folded dirs).
+    let collect: Bool
+    /// The scan root itself (its children become AnalyzeResult.entries).
+    let isRoot: Bool
+    /// true when this dir lives on another volume/firmlink and must not be walked.
+    let otherDevice: Bool
+    /// Alive while any child is unfinished (children only finalize before the parent).
+    unowned let parent: DirWork?
+    var read = false
+    var finalized = false
+    var pendingChildren = 0
+    var agg: Int64 = 0          // children bytes: non-dir sizes + finalized subdir totals
+    var count = 0
+    var partial = false
+    /// Discovered subdirectories; strong refs keep the live tree alive until finalize.
+    var subdirs: [DirWork] = []
+    var files: [ChildFile] = []
+    var largeCandidates: [LargeFile] = []
+    var node: AnalyzeNode?
+
+    init(path: String, name: String, dirID: FileID, ownEntry: Int64, collect: Bool,
+         isRoot: Bool, otherDevice: Bool, parent: DirWork?) {
+        self.path = path; self.name = name; self.dirID = dirID
+        self.ownEntry = ownEntry; self.collect = collect
+        self.isRoot = isRoot; self.otherDevice = otherDevice; self.parent = parent
+    }
+}
+
+/// Mutable state shared by the worker pool.
+private final class ScanState: @unchecked Sendable {
+    let lock = NSCondition()
+    var stack: [DirWork] = []
+    /// Directories discovered but not yet finalized; 0 ⇒ all workers may exit.
+    var liveDirs = 0
+    /// Root's completed child dirs; their totals become the entry list.
+    var rootDirs: [DirWork] = []
+}
+
+/// Directory analyzer (Mole `mo analyze`, scanner.go). For a directory it returns its
+/// direct children with recursive allocated size plus a top-N large-file list. Symlinks
+/// are never followed, hard links count once per scan, only the root's volume is walked.
+/// Directories are read with getattrlistbulk and walked by a bounded worker pool over a
+/// shared queue, so one huge child no longer serializes the whole subtree. With
+/// `keepTree` the aggregated per-directory children are kept for instant drill-in.
 public struct DiskScanner: Sendable {
     /// Large-file list keeps at most this many entries (Mole Top-20 heap).
     public var maxLargeFiles = 20
-    /// Files at or above this size become large-file candidates (Mole Spotlight threshold 100MB
-    /// is skipped; the heap effectively collects every file, so we bound it with a threshold).
+    /// Files at or above this size become large-file candidates.
     public var largeFileMinBytes: Int64 = 1_000_000
+    /// Directory-walk workers; tests lower it to compare against a serial pass.
+    var workerCount = ProcessInfo.processInfo.activeProcessorCount
 
     public init() {}
 
@@ -118,157 +271,342 @@ public struct DiskScanner: Sendable {
         "vue", "nim", "hx",
     ]
 
-    public func scan(_ rawPath: String, cancellation: ScanCancellation? = nil) throws -> AnalyzeResult {
+    public func scan(_ rawPath: String, cancellation: ScanCancellation? = nil,
+                     keepTree: Bool = false) throws -> AnalyzeResult {
         let root = PathPolicy.normalize(rawPath)
         var st = stat()
         // the root itself may be a symlink to a directory
         guard followStat(root, &st) == 0 else { throw AnalyzeError.notFound(root) }
         guard (st.st_mode & S_IFMT) == S_IFDIR else { throw AnalyzeError.notDirectory(root) }
-        let rootDev = st.st_dev
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: root) else {
-            throw AnalyzeError.notReadable(root)
-        }
+        let rootDev = UInt64(UInt32(bitPattern: st.st_dev))
+        let rootID = FileID(dev: rootDev, ino: UInt64(st.st_ino))
 
-        let children = names.filter { name in
-            if Self.skipDirs.contains(name) { return false }
-            if root == "/" && Self.skipSystemDirs.contains(name) { return false }
-            return true
-        }
-
+        let state = ScanState()
         let seen = SeenLinks()
-        var boxes = [Measured](repeating: Measured(), count: children.count)
-        boxes.withUnsafeMutableBufferPointer { buf in
-            let b = buf
-            DispatchQueue.concurrentPerform(iterations: children.count) { i in
-                if cancellation?.isCancelled == true { return }
-                b[i] = self.measure(root + "/" + children[i], name: children[i],
-                                    rootDev: rootDev, seen: seen, cancellation: cancellation)
+        let rootWork = DirWork(path: root, name: (root as NSString).lastPathComponent,
+                               dirID: rootID, ownEntry: 0, collect: true,
+                               isRoot: true, otherDevice: false, parent: nil)
+        var buffer = [CChar](repeating: 0, count: 256 * 1024)
+        state.liveDirs = 1
+        // root listing runs synchronously so an unreadable root still throws
+        let opened = buffer.withUnsafeMutableBufferPointer { buf in
+            readDir(rootWork, state: state, rootDev: rootDev, seen: seen,
+                    keepTree: keepTree, cancellation: cancellation,
+                    isRoot: true, buffer: buf)
+        }
+        if !opened { throw AnalyzeError.notReadable(root) }
+
+        let workers = min(max(1, workerCount), 64)
+        DispatchQueue.concurrentPerform(iterations: workers) { _ in
+            // each worker owns its bulk-read buffer for the whole loop
+            var own = [CChar](repeating: 0, count: 256 * 1024)
+            own.withUnsafeMutableBufferPointer { buf in
+                workerLoop(state: state, rootDev: rootDev, seen: seen,
+                           keepTree: keepTree, cancellation: cancellation, buffer: buf)
             }
         }
 
+        // root's children become the entry list (dirs arrived via finish() → rootDirs)
         var result = AnalyzeResult(root: root, entries: [], largeFiles: [],
-                                   totalSize: 0, totalFiles: 0,
-                                   partial: false, cancelled: cancellation?.isCancelled == true)
-        for box in boxes {
-            guard let entry = box.entry else { continue }
-            result.entries.append(entry)
-            result.totalSize += entry.size
-            result.totalFiles += entry.itemCount
-            result.partial = result.partial || entry.partial
-            merge(&result.largeFiles, box.top)
+                                   totalSize: rootWork.agg, totalFiles: rootWork.count,
+                                   partial: rootWork.partial,
+                                   cancelled: cancellation?.isCancelled == true)
+        for f in rootWork.files {
+            let p = root + "/" + f.name
+            result.entries.append(AnalyzeEntry(
+                name: f.name, path: p, size: f.size,
+                isDir: f.isSymlink && Self.isDirTarget(p), isSymlink: f.isSymlink,
+                itemCount: f.itemCount, partial: f.partial, identity: f.identity))
         }
-        sortTop(&result.largeFiles)
+        for d in state.rootDirs {
+            result.entries.append(AnalyzeEntry(
+                name: d.name, path: d.path, size: d.ownEntry + d.agg, isDir: true,
+                isSymlink: false, itemCount: d.count, partial: d.partial,
+                identity: PathIdentity(parent: rootID, target: d.dirID)))
+        }
+        sortTop(&rootWork.largeCandidates)
+        result.largeFiles = rootWork.largeCandidates
         result.entries.sort { $0.size != $1.size ? $0.size > $1.size : $0.path < $1.path }
+        result.tree = rootWork.node
         return result
     }
 
-    // MARK: subtree measurement
+    // MARK: worker pool
 
-    private func measure(_ path: String, name: String, rootDev: dev_t, seen: SeenLinks,
-                         cancellation: ScanCancellation?) -> Measured {
-        let identity = PathIdentity.capture(path)
-        var st = stat()
-        guard lstat(path, &st) == 0 else {
-            return Measured(entry: AnalyzeEntry(name: name, path: path, size: 0, isDir: false,
-                                                isSymlink: false, itemCount: 0, partial: true,
-                                                identity: identity))
-        }
-        let mode = st.st_mode & S_IFMT
+    private func workerLoop(state: ScanState, rootDev: UInt64, seen: SeenLinks,
+                            keepTree: Bool, cancellation: ScanCancellation?,
+                            buffer: UnsafeMutableBufferPointer<CChar>) {
+        while true {
+            state.lock.lock()
+            while state.stack.isEmpty && state.liveDirs > 0 {
+                if cancellation?.isCancelled == true {
+                    state.lock.unlock()
+                    state.lock.broadcast()
+                    return
+                }
+                state.lock.wait(until: Date().addingTimeInterval(0.1))
+            }
+            if state.liveDirs == 0 {
+                state.lock.unlock()
+                state.lock.broadcast()
+                return
+            }
+            let work = state.stack.removeLast()
+            state.lock.unlock()
 
-        if mode == S_IFLNK {
-            // the link itself only; a dir target is marked drillable but never descended
-            var t = stat()
-            let dirTarget = followStat(path, &t) == 0 && (t.st_mode & S_IFMT) == S_IFDIR
-            return Measured(entry: AnalyzeEntry(name: name, path: path, size: actualSize(st),
-                                                isDir: dirTarget, isSymlink: true,
-                                                itemCount: 0, partial: false,
-                                                identity: identity))
-        }
-
-        if mode != S_IFDIR {
-            var top: [LargeFile] = []
-            let size = mode == S_IFREG
-                ? countable(st, path: path, seen: seen, collect: true, top: &top)
-                : actualSize(st)
-            return Measured(entry: AnalyzeEntry(name: name, path: path, size: size, isDir: false,
-                                                isSymlink: false,
-                                                itemCount: mode == S_IFREG ? 1 : 0,
-                                                partial: false, identity: identity),
-                            top: top)
-        }
-
-        var total = actualSize(st)
-        var count = 0                     // regular files only, like Mole TotalFiles
-        var partial = false
-        var top: [LargeFile] = []
-        // a mounted volume or firmlink reports a different device: list it but do not descend
-        if st.st_dev != rootDev {
-            return Measured(entry: AnalyzeEntry(name: name, path: path, size: total, isDir: true,
-                                                isSymlink: false, itemCount: count, partial: false,
-                                                identity: identity))
-        }
-
-        var visited = 0
-        var stack: [(dir: String, collect: Bool)] = [(path, !Self.foldedDirs.contains(name))]
-        while let (dir, collect) = stack.popLast() {
-            if cancellation?.isCancelled == true { partial = true; break }
-            guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else {
-                partial = true
+            if cancellation?.isCancelled == true {
+                state.lock.lock()
+                work.read = true
+                work.partial = true
+                finish(work, state: state, keepTree: keepTree)
+                state.lock.unlock()
                 continue
             }
-            for child in names {
-                visited += 1
-                if visited % 256 == 0 && cancellation?.isCancelled == true { partial = true; break }
-                let childPath = dir + "/" + child
-                var cs = stat()
-                guard lstat(childPath, &cs) == 0 else { partial = true; continue }
-                let cm = cs.st_mode & S_IFMT
-                if cm == S_IFDIR {
-                    total += actualSize(cs)
-                    if cs.st_dev == rootDev {
-                        stack.append((childPath, collect && !Self.foldedDirs.contains(child)))
-                    }
-                } else if cm == S_IFLNK {
-                    total += actualSize(cs)
-                } else if cm == S_IFREG {
-                    if collect { count += 1 }   // folded-dir contents are not enumerated (Mole)
-                    total += countable(cs, path: childPath, seen: seen, collect: collect, top: &top)
-                } else {
-                    total += actualSize(cs)
+            _ = readDir(work, state: state, rootDev: rootDev, seen: seen,
+                        keepTree: keepTree, cancellation: cancellation,
+                        isRoot: false, buffer: buffer)
+        }
+    }
+
+    /// Read one directory's entries via getattrlistbulk and queue subdirectories.
+    /// Runs outside the shared lock; everything is published under it at the end.
+    /// Returns whether the directory could be opened (used for the notReadable root check).
+    private func readDir(_ work: DirWork, state: ScanState, rootDev: UInt64,
+                         seen: SeenLinks, keepTree: Bool,
+                         cancellation: ScanCancellation?, isRoot: Bool,
+                         buffer: UnsafeMutableBufferPointer<CChar>) -> Bool {
+        let keepChildren = keepTree || isRoot
+        var accum = Accum()
+        var discovered: [DirWork] = []
+        var opened = false
+        defer {
+            state.lock.lock()
+            work.read = true
+            work.partial = work.partial || accum.partial
+            work.agg += accum.agg
+            work.count += accum.count
+            work.files = accum.files
+            merge(&work.largeCandidates, accum.candidates)
+            // children are owned by their parent's list from discovery on — that is
+            // what keeps an un-read-but-queued child's unowned parent alive
+            work.subdirs.append(contentsOf: discovered)
+            work.pendingChildren += discovered.count
+            state.liveDirs += discovered.count
+            state.stack.append(contentsOf: discovered)
+            if !discovered.isEmpty { state.lock.broadcast() }
+            finish(work, state: state, keepTree: keepTree)
+            state.lock.unlock()
+        }
+        // other volumes/firmlinks are listed but never walked
+        if work.otherDevice { return true }
+        if cancellation?.isCancelled == true { accum.partial = true; return true }
+
+        let fd = open(work.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else {
+            accum.partial = true
+            return false
+        }
+        opened = true
+        defer { close(fd) }
+
+        while true {
+            let n = getattrlistbulk(fd, &Self.bulkAttrs,
+                                    buffer.baseAddress, buffer.count, 0)
+            if n < 0 {
+                if errno == EINTR { continue }
+                accum.partial = true
+                break
+            }
+            if n == 0 { break }
+            let raw = UnsafeBufferPointer(buffer)
+            var off = 0
+            for _ in 0..<n {
+                let entry = Self.parseEntry(raw, at: &off)
+                accum.seen += 1
+                if accum.seen % 256 == 0, cancellation?.isCancelled == true {
+                    accum.partial = true
+                    accum.cancelled = true
+                    break
                 }
+                if entry.error {
+                    accum.partial = true
+                    // keep a zero-size partial row like the old per-entry lstat path did
+                    if keepChildren, !entry.name.isEmpty {
+                        accum.files.append(ChildFile(
+                            name: entry.name, size: 0, itemCount: 0, isSymlink: false,
+                            partial: true,
+                            fileID: FileID(dev: UInt64(entry.dev), ino: entry.ino),
+                            parentID: work.dirID))
+                    }
+                    continue
+                }
+                if isRoot && (Self.skipDirs.contains(entry.name)
+                              || (work.path == "/" && Self.skipSystemDirs.contains(entry.name))) {
+                    continue
+                }
+                handle(entry, of: work, rootDev: rootDev, seen: seen,
+                       keepChildren: keepChildren,
+                       discovered: &discovered, accum: &accum)
+            }
+            if accum.cancelled || cancellation?.isCancelled == true {
+                accum.partial = true
+                break
             }
         }
-        sortTop(&top)
-        return Measured(entry: AnalyzeEntry(name: name, path: path, size: total, isDir: true,
-                                            isSymlink: false, itemCount: count, partial: partial,
-                                            identity: identity),
-                        top: top)
+        return opened
     }
 
-    private struct Measured: Sendable {
-        var entry: AnalyzeEntry?
-        var top: [LargeFile] = []
-    }
-
-    /// Mole `countableFileSize`: hard links (nlink>1) count once per scan pass.
-    /// A regular file over the threshold also becomes a large-file candidate.
-    private func countable(_ st: stat, path: String, seen: SeenLinks,
-                           collect: Bool, top: inout [LargeFile]) -> Int64 {
-        if st.st_nlink > 1 {
-            let id = FileID(dev: UInt64(UInt32(bitPattern: st.st_dev)), ino: UInt64(st.st_ino))
-            if !seen.insert(id) { return 0 }
+    /// Accumulate one bulk entry into the dir's totals; queue same-device subdirs.
+    private func handle(_ entry: BulkEntry, of work: DirWork, rootDev: UInt64,
+                        seen: SeenLinks, keepChildren: Bool,
+                        discovered: inout [DirWork], accum: inout Accum) {
+        let size = min(entry.allocSize, entry.dataLength)     // Mole getActualFileSize
+        let fileID = FileID(dev: UInt64(entry.dev), ino: entry.ino)
+        let childPath = work.path + "/" + entry.name
+        switch entry.objtype {
+        case 2:                                                 // VDIR
+            let other = UInt64(entry.dev) != rootDev
+            if !other || keepChildren {
+                // the dir's own entry size rides the queue and lands via finish()
+                discovered.append(DirWork(
+                    path: childPath, name: entry.name, dirID: fileID, ownEntry: size,
+                    collect: work.collect && !Self.foldedDirs.contains(entry.name),
+                    isRoot: false, otherDevice: other, parent: work))
+            } else {
+                accum.agg += size      // other volume/firmlink: own entry only, never walked
+            }
+        case 5:                                                 // VLNK — never followed
+            accum.agg += size
+            if keepChildren {
+                accum.files.append(ChildFile(name: entry.name, size: size, itemCount: 0,
+                                             isSymlink: true, partial: false,
+                                             fileID: fileID, parentID: work.dirID))
+            }
+        case 1:                                                 // VREG
+            if work.collect { accum.count += 1 }
+            var size = size
+            if entry.nlink > 1, !seen.insert(fileID) { size = 0 }
+            accum.agg += size
+            if work.collect, size >= largeFileMinBytes,
+               !Self.skipExtensions.contains((childPath as NSString).pathExtension.lowercased()) {
+                push(&accum.candidates,
+                     LargeFile(path: childPath, size: size,
+                               identity: PathIdentity(parent: work.dirID, target: fileID)))
+            }
+            if keepChildren {
+                accum.files.append(ChildFile(name: entry.name, size: size, itemCount: 1,
+                                             isSymlink: false, partial: false,
+                                             fileID: fileID, parentID: work.dirID))
+            }
+        default:
+            accum.agg += size
+            if keepChildren {
+                accum.files.append(ChildFile(name: entry.name, size: size, itemCount: 0,
+                                             isSymlink: false, partial: false,
+                                             fileID: fileID, parentID: work.dirID))
+            }
         }
-        let size = actualSize(st)
-        if collect, size >= largeFileMinBytes,
-           !Self.skipExtensions.contains((path as NSString).pathExtension.lowercased()) {
-            push(&top, LargeFile(path: path, size: size, identity: PathIdentity.capture(path)))
-        }
-        return size
     }
 
-    /// Mole `getActualFileSize`: min(allocated blocks, logical size).
-    private func actualSize(_ st: stat) -> Int64 {
-        min(Int64(st.st_blocks) * 512, st.st_size)
+    /// A dir is done once read and all queued children finalized; then it reports its
+    /// totals into the parent (or the root entry list) and may finish the parent too.
+    /// Called under the shared lock; cascades stay on one thread (depth = dir depth).
+    private func finish(_ work: DirWork, state: ScanState, keepTree: Bool) {
+        guard !work.finalized, work.read, work.pendingChildren == 0 else { return }
+        work.finalized = true
+        if keepTree {
+            var top = work.largeCandidates
+            sortTop(&top)
+            work.node = AnalyzeNode(
+                path: work.path, name: work.name, size: work.ownEntry + work.agg,
+                childrenTotal: work.agg, itemCount: work.count, partial: work.partial,
+                identity: PathIdentity(parent: work.parent?.dirID, target: work.dirID),
+                isOtherDevice: work.otherDevice, collected: work.collect,
+                dirs: work.subdirs.compactMap(\.node), files: work.files, topFiles: top)
+        }
+        work.subdirs = []
+        state.liveDirs -= 1
+        if state.liveDirs == 0 { state.lock.broadcast() }
+        guard let parent = work.parent else { return }
+        parent.agg += work.ownEntry + work.agg
+        parent.count += work.count
+        parent.partial = parent.partial || work.partial
+        merge(&parent.largeCandidates, work.largeCandidates)
+        parent.pendingChildren -= 1
+        if parent.isRoot { state.rootDirs.append(work) }
+        if parent.read, parent.pendingChildren == 0 {
+            finish(parent, state: state, keepTree: keepTree)
+        }
+    }
+
+    // MARK: getattrlistbulk
+
+    /// stat that follows the link: true when a symlink resolves to a directory.
+    static func isDirTarget(_ path: String) -> Bool {
+        var st = stat()
+        return followStat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR
+    }
+
+    /// Attributes fetched per entry: name + vnode type + ids (common), link count +
+    /// sizes (file). Returned fields follow ascending bit order within each group.
+    private static var bulkAttrs: attrlist = {
+        var al = attrlist()
+        al.bitmapcount = u_short(ATTR_BIT_MAP_COUNT)
+        al.commonattr = ATTR_CMN_RETURNED_ATTRS | ag(ATTR_CMN_NAME) | ag(ATTR_CMN_DEVID)
+            | ag(ATTR_CMN_OBJTYPE) | ag(ATTR_CMN_FILEID)
+        al.fileattr = ag(ATTR_FILE_LINKCOUNT) | ag(ATTR_FILE_ALLOCSIZE)
+            | ag(ATTR_FILE_DATALENGTH)
+        return al
+    }()
+
+    private static func ag(_ v: Int32) -> attrgroup_t { attrgroup_t(bitPattern: v) }
+
+    /// Decode one entry at `off` (advanced to the next record).
+    private static func parseEntry(_ raw: UnsafeBufferPointer<CChar>,
+                                   at off: inout Int) -> BulkEntry {
+        var e = BulkEntry()
+        guard let base = raw.baseAddress else { return e }
+        let entry = base + off
+        e.error = true
+        let len = Int(UnsafeRawPointer(entry).load(as: UInt32.self))
+        defer { off += len }
+
+        var aset = attribute_set_t()
+        memcpy(&aset, entry + 4, MemoryLayout<attribute_set_t>.size)
+        // ATTR_CMN_ERROR means some attrs failed; the name is usually still
+        // returned, so keep decoding it and let the caller mark the row partial
+        e.error = aset.commonattr & ag(ATTR_CMN_ERROR) != 0
+        var p = entry + 4 + MemoryLayout<attribute_set_t>.size
+
+        if aset.commonattr & ag(ATTR_CMN_NAME) != 0 {
+            var ref = attrreference_t()
+            memcpy(&ref, p, MemoryLayout<attrreference_t>.size)
+            let nb = p + Int(ref.attr_dataoffset)
+            var bytes = UnsafeRawBufferPointer(start: nb, count: Int(ref.attr_length))
+            if bytes.last == 0 { bytes = UnsafeRawBufferPointer(rebasing: bytes.dropLast()) }
+            e.name = String(decoding: bytes, as: UTF8.self)
+            p += MemoryLayout<attrreference_t>.size
+        }
+        if e.error { return e }
+        if aset.commonattr & ag(ATTR_CMN_DEVID) != 0 {
+            memcpy(&e.dev, p, 4); p += 4
+        }
+        if aset.commonattr & ag(ATTR_CMN_OBJTYPE) != 0 {
+            memcpy(&e.objtype, p, 4); p += 4
+        }
+        if aset.commonattr & ag(ATTR_CMN_FILEID) != 0 {
+            memcpy(&e.ino, p, 8); p += 8
+        }
+        if aset.fileattr & ag(ATTR_FILE_LINKCOUNT) != 0 {
+            memcpy(&e.nlink, p, 4); p += 4
+        }
+        if aset.fileattr & ag(ATTR_FILE_ALLOCSIZE) != 0 {
+            memcpy(&e.allocSize, p, 8); p += 8
+        }
+        if aset.fileattr & ag(ATTR_FILE_DATALENGTH) != 0 {
+            memcpy(&e.dataLength, p, 8); p += 8
+        }
+        return e
     }
 
     private func push(_ top: inout [LargeFile], _ file: LargeFile) {

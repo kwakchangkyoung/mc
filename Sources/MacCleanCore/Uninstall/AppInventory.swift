@@ -42,15 +42,7 @@ public struct AppInventory: Sendable {
     /// `sizeDeadline` bounds the parallel bundle sizing pass, like Mole's du timeout.
     public func scan(protection: ProtectionPolicy,
                      sizeDeadline: Date = Date().addingTimeInterval(30)) -> [InstalledApp] {
-        var apps: [InstalledApp] = []
-        for root in roots { collect(root, depth: 1, into: &apps, protection: protection) }
-
-        // dedupe on bundle_id|basename; earlier roots win (Mole priority order)
-        var seen = Set<String>()
-        apps = apps.filter {
-            seen.insert($0.bundleID.lowercased() + "|" + ($0.path as NSString).lastPathComponent).inserted
-        }
-
+        var apps = discover(protection: protection)
         // sizes in parallel, same pattern as CleanScanner
         var sizes = [SizeResult](repeating: .zero, count: apps.count)
         sizes.withUnsafeMutableBufferPointer { buf in
@@ -60,6 +52,19 @@ public struct AppInventory: Sendable {
             }
         }
         for i in apps.indices { apps[i].size = sizes[i] }
+        return apps
+    }
+
+    /// Discovery only: the app list with sizes left `.zero` for callers to fill lazily.
+    public func discover(protection: ProtectionPolicy) -> [InstalledApp] {
+        var apps: [InstalledApp] = []
+        for root in roots { collect(root, depth: 1, into: &apps, protection: protection) }
+
+        // dedupe on bundle_id|basename; earlier roots win (Mole priority order)
+        var seen = Set<String>()
+        apps = apps.filter {
+            seen.insert($0.bundleID.lowercased() + "|" + ($0.path as NSString).lastPathComponent).inserted
+        }
 
         // Mole sorts by last-used ascending: least recently used first.
         apps.sort { ($0.lastUsed ?? .distantPast) < ($1.lastUsed ?? .distantPast) }

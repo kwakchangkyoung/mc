@@ -7,7 +7,7 @@ final class AnalyzeModel: ObservableObject {
     enum Tab { case entries, largeFiles }
 
     @Published var path = AppEnvironment.current.home
-    @Published var history: [String] = []
+    @Published var canGoBack = false
     @Published var result: AnalyzeResult?
     @Published var scanning = false
     @Published var error: String?
@@ -16,6 +16,10 @@ final class AnalyzeModel: ObservableObject {
     @Published var tab: Tab = .entries
 
     private var cancellation: ScanCancellation?
+    /// Aggregated scan tree backing the displayed result — makes drill-in/back instant.
+    private var node: AnalyzeNode?
+    /// States to return to, latest last; a nil node means that level needs a rescan.
+    private var backStack: [(path: String, node: AnalyzeNode?)] = []
 
     var selectedEntry: AnalyzeEntry? { result?.entries.first { $0.path == selection } }
     var selectedName: String { ((selection ?? "") as NSString).lastPathComponent }
@@ -29,7 +33,8 @@ final class AnalyzeModel: ObservableObject {
 
     func scan(_ target: String? = nil, push: Bool = false) {
         let t = target ?? path
-        if push && t != path { history.append(path) }
+        if push && t != path { backStack.append((path, node)) }
+        canGoBack = !backStack.isEmpty
         cancellation?.cancel()
         let token = ScanCancellation()
         cancellation = token
@@ -40,10 +45,11 @@ final class AnalyzeModel: ObservableObject {
         Task {
             do {
                 let r = try await Task.detached(priority: .userInitiated) {
-                    try DiskScanner().scan(t, cancellation: token)
+                    try DiskScanner().scan(t, cancellation: token, keepTree: true)
                 }.value
                 guard cancellation === token, !r.cancelled else { return }
                 result = r
+                node = r.tree
                 scanning = false
             } catch {
                 guard cancellation === token else { return }
@@ -58,18 +64,43 @@ final class AnalyzeModel: ObservableObject {
         scanning = false
     }
 
+    /// Show a cached subtree instantly — same shape as a fresh scan of that directory.
+    private func apply(_ target: AnalyzeNode) {
+        path = target.path
+        node = target
+        result = target.asResult()
+        selection = nil
+        scanning = false
+    }
+
     func goBack() {
-        guard let prev = history.popLast() else { return }
-        scan(prev)
+        guard let prev = backStack.popLast() else { return }
+        canGoBack = !backStack.isEmpty
+        if let n = prev.node { apply(n) } else { scan(prev.path) }
     }
 
     func drill(_ entry: AnalyzeEntry) {
         guard entry.isDir else { return }
-        scan(entry.path, push: true)
+        // symlink targets, other volumes and folded dirs need a fresh walk: rescan
+        if let child = node?.dirs.first(where: { $0.path == entry.path }),
+           !child.isOtherDevice, child.collected {
+            backStack.append((path, node))
+            canGoBack = true
+            apply(child)
+        } else {
+            scan(entry.path, push: true)
+        }
     }
 
     func navigate(to crumb: String) {
         guard crumb != path else { return }
+        while let last = backStack.popLast() {
+            if last.path == crumb {
+                canGoBack = !backStack.isEmpty
+                if let n = last.node { apply(n) } else { scan(last.path) }
+                return
+            }
+        }
         scan(crumb, push: true)
     }
 
@@ -151,7 +182,7 @@ struct AnalyzeView: View {
             Button { model.goBack() } label: {
                 Image(systemName: "chevron.left")
             }
-            .disabled(model.history.isEmpty)
+            .disabled(!model.canGoBack)
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 3) {
                     ForEach(Array(crumbs.enumerated()), id: \.offset) { i, c in
