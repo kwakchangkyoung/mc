@@ -78,20 +78,26 @@ public struct ProtectionPolicy: Sendable {
         return Glob.match("Cache/?*", rest) || Glob.match("Service Worker/CacheStorage/?*", rest)
     }
 
-    // MARK: should_protect_path (clean mode, app_protection.sh:406-681)
+    // MARK: should_protect_path (app_protection.sh:406-681)
 
-    public func shouldProtectPath(_ path: String) -> Bool {
+    /// `uninstall` = Mole `MOLE_UNINSTALL_MODE=1`: DATA_PROTECTED rules no longer apply (the user
+    /// explicitly chose the app), only system-critical bundles stay protected. Steam is blocked.
+    public func shouldProtectPath(_ path: String, uninstall: Bool = false) -> Bool {
         if path.isEmpty { return false }
         let h = home
 
         // clean-only user state
-        if Glob.matchesAny([
+        if !uninstall && Glob.matchesAny([
             "\(h)/.prometheus/data", "\(h)/.prometheus/data/*", "\(h)/.jupyter/runtime", "\(h)/.jupyter/runtime/*",
             "\(h)/.yarn/berry/cache", "\(h)/.yarn/berry/cache/*", "\(h)/.gitconfig.lock", "\(h)/.gitconfig.bak*",
             "\(h)/.config/fish/fish_history.bak*", "\(h)/.bash_history.bak*", "\(h)/.zsh_history.bak*",
         ], path) { return true }
 
         if isSharedHomeStateRoot(path) { return true }
+
+        // uninstall-only: the Steam library folder is never a leftover (app_protection.sh:362-375)
+        let steam = h + "/Library/Application Support/Steam"
+        if uninstall && (path == steam || path.hasPrefix(steam + "/")) { return true }
 
         let codexRoot = "\(h)/Library/Caches/Codex/"
         let knownRebuildable = [
@@ -120,7 +126,7 @@ public struct ProtectionPolicy: Sendable {
                                 "\(h)/Library/Containers/com.tencent.xinWeChat/Data/.wxapplet/WMPF/*"], path)
                 || isWeChatWebProfileCacheChild(path) {
                 containerCachePath = true
-            } else if shouldProtectData(bundleID) {
+            } else if !uninstall && shouldProtectData(bundleID) {
                 return true
             }
         }
@@ -139,6 +145,13 @@ public struct ProtectionPolicy: Sendable {
 
         if !codexPendingTopLevel && Glob.matchesAny(Self.protectedPathPatterns, path) { return true }
 
+        if uninstall {
+            // step 6: only system-critical bundles stay protected in uninstall mode
+            let filename = (path as NSString).lastPathComponent
+            if Glob.matchesAny(ProtectionData.appleUninstallableApps, filename) { return false }
+            return Glob.matchesAny(ProtectionData.systemCriticalBundles, filename)
+        }
+
         if !containerCachePath && !knownRebuildable {
             if Glob.matchesAny(Self.cleanProtectedGlobs, path) { return true }
             let filename = (path as NSString).lastPathComponent
@@ -146,6 +159,47 @@ public struct ProtectionPolicy: Sendable {
         }
         return false
     }
+
+    // MARK: uninstall protection (app_protection.sh:143, :161)
+
+    /// Mole `should_protect_from_uninstall`: APPLE_UNINSTALLABLE wins over SYSTEM_CRITICAL.
+    public func shouldProtectFromUninstall(_ bundleID: String) -> Bool {
+        if Glob.matchesAny(ProtectionData.appleUninstallableApps, bundleID) { return false }
+        return Glob.matchesAny(ProtectionData.systemCriticalBundles, bundleID)
+    }
+
+    /// Apps that must be removed with their own uninstaller (Mole OFFICIAL_UNINSTALLER_RULES).
+    /// Returns the vendor name when the app matches a bundle-id prefix or a name fragment.
+    public func officialUninstallerVendor(bundleID: String, name: String) -> String? {
+        let id = bundleID.lowercased()
+        let names = (name + " " + bundleID).lowercased()
+        for rule in Self.officialUninstallerRules {
+            if rule.prefixes.contains(where: { id.hasPrefix($0) }) { return rule.vendor }
+            if rule.fragments.contains(where: { names.contains($0) }) { return rule.vendor }
+        }
+        return nil
+    }
+
+    private static let officialUninstallerRules:
+        [(vendor: String, prefixes: [String], fragments: [String])] = [
+            ("ESET", ["com.eset."], ["eset"]),
+            ("Jamf", ["com.jamf.", "com.jamfsoftware."], ["jamf"]),
+            ("CrowdStrike", ["com.crowdstrike."], ["crowdstrike", "falcon"]),
+            ("SentinelOne", ["com.sentinelone.", "com.sentinel-labs."], ["sentinelone"]),
+            ("GlobalProtect", ["com.paloaltonetworks."], ["globalprotect", "palo alto"]),
+            ("Cisco", ["com.cisco.anyconnect", "com.cisco.secureclient"], ["anyconnect", "secureclient"]),
+            ("Alibaba Cloud Security", ["com.alibaba.security."], ["alibaba"]),
+            ("Adobe Genuine Service", ["com.adobe.genuine"], ["adobe genuine"]),
+            ("Avast", ["com.avast."], ["avast"]),
+            ("AVG", ["com.avg."], ["avg"]),
+            ("Malwarebytes", ["com.malwarebytes."], ["malwarebytes"]),
+            ("TeamViewer", ["com.teamviewer."], ["teamviewer"]),
+            ("Bitdefender", ["com.bitdefender."], ["bitdefender"]),
+            ("Intego", ["com.intego."], ["intego"]),
+            ("Kaspersky", ["com.kaspersky."], ["kaspersky"]),
+            ("Norton", ["com.norton.", "com.symantec."], ["norton"]),
+            ("Trend Micro", ["com.trendmicro."], ["trend micro", "trendmicro"]),
+        ]
 
     static func containerBundleID(_ path: String) -> String? {
         for marker in ["/Library/Containers/", "/Library/Group Containers/"] {

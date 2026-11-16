@@ -123,7 +123,8 @@ public struct PathPolicy: Sendable {
     // MARK: validate
 
     /// Returns nil when the path may be deleted.
-    public func validate(_ rawPath: String, probes: ProbeContext) -> Refusal? {
+    /// `uninstall` selects Mole `MOLE_UNINSTALL_MODE` protection rules (system-critical only).
+    public func validate(_ rawPath: String, probes: ProbeContext, uninstall: Bool = false) -> Refusal? {
         if rawPath.isEmpty { return .emptyPath }
         if !rawPath.hasPrefix("/") { return .notAbsolute }
         if rawPath.split(separator: "/", omittingEmptySubsequences: false).contains("..") { return .parentTraversal }
@@ -171,7 +172,7 @@ public struct PathPolicy: Sendable {
         // ~/.Trash/<top> skips protection; everything else goes through should_protect_path
         let trash = home + "/.Trash/"
         let isTrashTop = path.hasPrefix(trash) && !path.dropFirst(trash.count).contains("/")
-        if !isTrashTop && protection.shouldProtectPath(path) { return .protected }
+        if !isTrashTop && protection.shouldProtectPath(path, uninstall: uninstall) { return .protected }
         return nil
     }
 

@@ -48,4 +48,75 @@ enum HeadlessReport {
         }
         print("TOTAL \(ByteFormat.string(result.totalBytes)) \(result.itemCount) items")
     }
+
+    /// `mo analyze --json <path>` equivalent: children + sizes, never deletes.
+    static func printAnalyze(_ path: String) {
+        let result: AnalyzeResult
+        do { result = try DiskScanner().scan(path) } catch {
+            print("analyze failed: \(error)")
+            exit(1)
+        }
+        for e in result.entries {
+            print("\(e.isDir ? "d" : "f") \(ByteFormat.string(e.size, partial: e.partial))\t\(e.itemCount)\t\(e.path)")
+        }
+        for f in result.largeFiles { print("L \(ByteFormat.string(f.size))\t\(f.path)") }
+        print("TOTAL \(ByteFormat.string(result.totalSize)) \(result.totalFiles) items"
+              + (result.partial ? " (partial)" : ""))
+    }
+
+    /// `mo uninstall --dry-run <app>` equivalent: app bundle + leftovers, never deletes.
+    static func printUninstallDryRun(_ query: String) {
+        let engine: UninstallEngine
+        do { engine = try AppEnvironment.current.makeUninstallEngine() } catch {
+            print("whitelist unreadable: \(error)")
+            exit(1)
+        }
+        let inventory = AppInventory(home: AppEnvironment.current.home)
+        let apps = inventory.scan(protection: engine.deleter.policy.protection)
+        let q = query.lowercased()
+        let matches = apps.filter {
+            $0.bundleID.lowercased() == q || $0.name.lowercased().contains(q)
+        }
+        if matches.isEmpty {
+            print("no installed app matches '\(query)'")
+            exit(1)
+        }
+        let probes = ProbeContext.capture()
+        for app in matches {
+            let plan = engine.plan(for: app,
+                                   siblings: UninstallEngine.siblings(of: app, in: apps),
+                                   probes: probes)
+            print("## \(app.name) \(app.version ?? "") (\(app.bundleID))")
+            print("  APP \(plan.bundleItem.path)\t\(plan.bundleItem.size.bytes)")
+            for item in plan.leftovers {
+                print("  \(item.requiresAdmin ? "ADMIN" : "OK")\t\(item.path)\t\(item.size.bytes)")
+            }
+            for s in plan.skipped { print("  SKIP\t\(s.path)\t\(s.reason.rawValue)") }
+            if let vendor = app.officialUninstaller {
+                print("  NOTE official uninstaller required: \(vendor)")
+            }
+        }
+    }
+
+    /// `mo optimize --dry-run` equivalent: every task + why it would run or skip.
+    /// Dry-run tasks only read state — nothing is changed.
+    static func printOptimizeDryRun() {
+        let engine: OptimizeEngine
+        do { engine = try AppEnvironment.current.makeOptimizeEngine() } catch {
+            print("whitelist unreadable: \(error)")
+            exit(1)
+        }
+        for line in OptimizeDiagnostics.run() { print("D \(line)") }
+        let probes = ProbeContext.capture()
+        var counts: [OptimizeOutcomeKind: Int] = [:]
+        for task in OptimizeTask.allCases {
+            let outcome = engine.run(task, dryRun: true, probes: probes)
+            counts[outcome.kind, default: 0] += 1
+            print("\(outcome.kind.rawValue)\t\(task.id)\t\(outcome.message)")
+            for d in outcome.detail { print("  \(d)") }
+        }
+        print("TOTAL " + OptimizeOutcomeKind.allCases
+            .compactMap { kind in counts[kind].map { "\(kind.rawValue) \($0)" } }
+            .joined(separator: " | "))
+    }
 }
