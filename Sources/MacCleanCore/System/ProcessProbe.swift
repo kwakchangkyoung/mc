@@ -77,6 +77,7 @@ public struct ProcessSnapshot: Sendable {
         var buf = [UInt8](repeating: 0, count: size)
         guard sysctl(&mib, 3, &buf, &size, nil, 0) == 0 else { return "" }
         let argc = buf.withUnsafeBytes { $0.loadUnaligned(as: Int32.self) }
+        guard argc > 0, argc <= 4096 else { return "" }
         var index = MemoryLayout<Int32>.size
         while index < size && buf[index] != 0 { index += 1 }      // exec path
         while index < size && buf[index] == 0 { index += 1 }      // padding

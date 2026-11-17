@@ -624,14 +624,12 @@ public struct DiskScanner: Sendable {
         if aset.fileattr & ag(ATTR_FILE_DATALENGTH) != 0 {
             memcpy(&e.dataLength, p, 8); p += 8
         }
-        // ATTR_CMN_ERROR (requested) leaves a u32 error code in the gap between
-        // the last attribute and the name data; the returned-attrs bit is only
-        // set on a real error, so check the bit first and a nonzero code as a
-        // fallback — the name usually survives, letting the caller keep a
-        // zero-size partial row like the old per-entry lstat path did
+        // ATTR_CMN_ERROR (requested) is only written by the kernel when the returned-attrs
+        // bit is set; reading 4 bytes when errBit is false would read into the name data
+        // or alignment padding and could falsely mark a healthy entry as partial
         let errBit = aset.commonattr & ag(ATTR_CMN_ERROR) != 0
         var code: UInt32 = 0
-        if errBit || p + 4 <= nameStart {
+        if errBit, p + 4 <= nameStart {
             memcpy(&code, p, 4)
             p += 4
         }

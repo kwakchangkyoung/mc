@@ -166,7 +166,7 @@
 
 ### 방법 1: GitHub Releases에서 다운로드 (권장)
 
-1. [**GitHub Releases 페이지**](https://github.com/kwakchangkyoung/mc/releases)에서 최신 버전의 `MacClean-v0.2.0-macos.dmg` 또는 `MacClean-v0.2.0-macos.zip` 파일을 다운로드합니다.
+1. [**GitHub Releases 페이지**](https://github.com/kwakchangkyoung/mc/releases)에서 최신 버전의 `MacClean-v0.2.1-macos.dmg` 또는 `MacClean-v0.2.1-macos.zip` 파일을 다운로드합니다.
 2. **DMG 다운로드 시**: 디스크 이미지를 열고 `MacClean.app`을 `Applications`(`응용 프로그램`) 폴더로 드래그합니다.
 3. **ZIP 다운로드 시**: 압축을 풀고 `MacClean.app`을 `Applications` 폴더로 이동합니다.
 
@@ -240,8 +240,8 @@ BIN="build/MacClean.app/Contents/MacOS/MacClean"
 ### 1. Git 태그 푸시로 자동 배포 (GitHub Actions)
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
 GitHub Actions가 자동으로 단위 테스트를 거쳐 Universal 바이너리(`.dmg`, `.zip`, `SHA256SUMS.txt`)를 빌드하고 Release를 생성합니다.
@@ -250,14 +250,14 @@ GitHub Actions가 자동으로 단위 테스트를 거쳐 Universal 바이너리
 
 ```bash
 # 1. build/release/ 하위에 배포 파일 생성 (.dmg, .zip, SHA256SUMS.txt)
-./scripts/package-release.sh 0.2.0
+./scripts/package-release.sh 0.2.1
 
 # 2. GitHub CLI로 릴리즈 생성 및 파일 업로드
-gh release create v0.2.0 \
-  build/release/MacClean-v0.2.0-macos.dmg \
-  build/release/MacClean-v0.2.0-macos.zip \
+gh release create v0.2.1 \
+  build/release/MacClean-v0.2.1-macos.dmg \
+  build/release/MacClean-v0.2.1-macos.zip \
   build/release/SHA256SUMS.txt \
-  --title "MacClean v0.2.0" \
+  --title "MacClean v0.2.1" \
   --generate-notes
 ```
 

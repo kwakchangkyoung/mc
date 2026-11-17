@@ -306,6 +306,11 @@ public struct LeftoverFinder: Sendable {
                     add(&paths, [dir + "/" + f])
                 }
             }
+            for f in children("/Library/PrivilegedHelperTools")
+            where !f.hasPrefix("com.apple.") && (f == b || f.hasPrefix(b + "."))
+                && !ownedBySibling(f) {
+                add(&paths, ["/Library/PrivilegedHelperTools/" + f])
+            }
             for f in children("/private/var/db/receipts") where f.hasPrefix(b) {
                 add(&paths, ["/private/var/db/receipts/" + f])
             }

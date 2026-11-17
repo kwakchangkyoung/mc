@@ -63,7 +63,7 @@ public struct OptimizeEngine: Sendable {
                            removed: inout Int, failed: inout Int, skipped: inout Int,
                            bytes: inout Int64) {
         switch deleter.remove(path, expected: PathIdentity.capture(path), dryRun: dryRun,
-                              probes: probes) {
+                              probes: probes, command: dryRun ? "optimize-dry-run" : "optimize") {
         case .removed(let s), .wouldRemove(let s):
             removed += 1
             bytes += s.bytes

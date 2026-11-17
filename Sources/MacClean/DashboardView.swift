@@ -17,7 +17,8 @@ final class StatusModel: ObservableObject {
                 let s = await Task.detached(priority: .utility) { collector.collect() }.value
                 self.snapshot = s
                 self.ready = true
-                try? await Task.sleep(for: .seconds(1))
+                let interval: Duration = NSApp.isActive ? .seconds(1) : .seconds(3)
+                try? await Task.sleep(for: interval)
             }
         }
     }

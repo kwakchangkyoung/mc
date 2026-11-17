@@ -146,6 +146,8 @@ final class AnalyzeModel: ObservableObject {
             }.value
             switch outcome {
             case .removed, .missing:
+                // Invalidate cached ancestor trees so navigating back reflects the freed space
+                backStack = backStack.map { ($0.path, nil) }
                 scan()
             case .skipped(let reason):
                 trashError = "이동할 수 없는 항목입니다: \(reason.rawValue)"

@@ -44,8 +44,9 @@ public struct SafeDeleter: Sendable {
     }
 
     public func remove(_ path: String, expected: PathIdentity?, dryRun: Bool, probes: ProbeContext,
-                       sizeDeadline: Date = Date().addingTimeInterval(30)) -> DeleteOutcome {
-        let command = dryRun ? "clean-dry-run" : "clean"
+                       sizeDeadline: Date = Date().addingTimeInterval(30),
+                       command customCommand: String? = nil) -> DeleteOutcome {
+        let command = customCommand ?? (dryRun ? "clean-dry-run" : "clean")
         if let refusal = check(path, probes: probes) {
             log?.record(command, "SKIPPED", path, refusal.rawValue)
             return .skipped(refusal)

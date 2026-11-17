@@ -6,6 +6,10 @@ struct SettingsView: View {
     private let env = AppEnvironment.current
     @State private var hasFDA = AppEnvironment.current.hasFullDiskAccess()
 
+    private var appVersion: String {
+        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.2.1"
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             PaneHeaderBar(pane: .settings) {
@@ -88,7 +92,7 @@ struct SettingsView: View {
                             HStack(spacing: 6) {
                                 Text("맥클린 (MacClean)")
                                     .fontWeight(.semibold)
-                                StatusPill(text: "v0.1.0", color: .blue)
+                                StatusPill(text: "v\(appVersion)", color: .blue)
                                 StatusPill(text: "GPL-3.0", color: .secondary)
                             }
                             Text("Mole (github.com/tw93/Mole, GPL-3.0)의 정리 규칙과 안전 장치를 Swift/SwiftUI 네이티브로 구현한 앱입니다. Mole 프로젝트와는 관련이 없습니다.")

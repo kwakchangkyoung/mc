@@ -25,6 +25,10 @@ final class UninstallModel: ObservableObject {
 
     /// Bumps on every loadApps so a stale sizing pass stops early and late
     /// results can't write into a newer list. Sendable: read from worker threads.
+    private final class SizingBuffer: @unchecked Sendable {
+        var values: [SizeResult]
+        init(count: Int) { values = [SizeResult](repeating: .zero, count: count) }
+    }
     private final class SizingGeneration: @unchecked Sendable {
         private let lock = NSLock()
         private var value = 0
@@ -95,16 +99,21 @@ final class UninstallModel: ObservableObject {
             let generation = sizingGeneration
             Task.detached(priority: .utility) {
                 let deadline = Date().addingTimeInterval(30)
+                let measured = SizingBuffer(count: found.count)
                 DispatchQueue.concurrentPerform(iterations: found.count) { i in
                     guard generation.isCurrent(token) else { return }
-                    let size = SizeCalculator.allocatedSize(of: found[i].path, deadline: deadline)
-                    Task { @MainActor in
-                        guard generation.isCurrent(token),
-                              i < self.apps.count, self.apps[i].path == found[i].path
-                        else { return }
-                        self.apps[i].size = size
-                        self.sizingPending.remove(found[i].path)
+                    measured.values[i] = SizeCalculator.allocatedSize(of: found[i].path, deadline: deadline)
+                }
+                guard generation.isCurrent(token) else { return }
+                let sizesByPath = Dictionary(uniqueKeysWithValues: zip(found.map(\.path), measured.values))
+                await MainActor.run {
+                    guard generation.isCurrent(token) else { return }
+                    for idx in self.apps.indices {
+                        if let s = sizesByPath[self.apps[idx].path] {
+                            self.apps[idx].size = s
+                        }
                     }
+                    self.sizingPending.removeAll()
                 }
             }
         }
@@ -147,9 +156,14 @@ final class UninstallModel: ObservableObject {
             do {
                 let engine = try AppEnvironment.current.makeUninstallEngine()
                 let probes = await Task.detached(priority: .userInitiated) { ProbeContext.capture() }.value
-                execution = try await Task.detached(priority: .userInitiated) {
+                let res = try await Task.detached(priority: .userInitiated) {
                     try engine.execute(app: plan.app, items: items, probes: probes)
                 }.value
+                execution = res
+                if !FileStat.exists(plan.app.path) || res.removedCount > 0 {
+                    apps.removeAll { $0.path == plan.app.path }
+                    sizingPending.remove(plan.app.path)
+                }
                 phase = .done
             } catch UninstallError.appRunning(let name) {
                 error = "\(name)이(가) 실행 중입니다. 앱을 종료한 뒤 다시 시도하세요."
@@ -455,6 +469,7 @@ struct UninstallView: View {
         if path.contains("/Containers/") || path.contains("/Group Containers/") { return "컨테이너" }
         if path.contains("/Logs/") { return "로그" }
         if path.contains("/LaunchAgents/") || path.contains("/LaunchDaemons/") { return "백그라운드 에이전트" }
+        if path.contains("/PrivilegedHelperTools/") { return "특권 헬퍼 도구" }
         return "관련 데이터"
     }
 
