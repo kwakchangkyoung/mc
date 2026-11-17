@@ -3,11 +3,16 @@ import MacCleanCore
 import SwiftUI
 
 struct SettingsView: View {
+    @ObservedObject var updater: UpdateModel
     private let env = AppEnvironment.current
     @State private var hasFDA = AppEnvironment.current.hasFullDiskAccess()
 
+    init(updater: UpdateModel) {
+        self.updater = updater
+    }
+
     private var appVersion: String {
-        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.2.1"
+        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.2.2"
     }
 
     var body: some View {
@@ -15,6 +20,7 @@ struct SettingsView: View {
             PaneHeaderBar(pane: .settings) {
                 Button {
                     hasFDA = env.hasFullDiskAccess()
+                    updater.checkForUpdates()
                 } label: {
                     Label("상태 새로고침", systemImage: "arrow.clockwise")
                 }
@@ -22,6 +28,62 @@ struct SettingsView: View {
             }
             Divider()
             Form {
+                Section("소프트웨어 업데이트") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 12) {
+                            AppLogoView(size: 38)
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 6) {
+                                    Text("현재 버전 v\(appVersion)")
+                                        .fontWeight(.semibold)
+                                    updateStatusBadge
+                                }
+                                Text(updateSubtitleText)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            updateActionButtons
+                        }
+
+                        if case .available(let release) = updater.state, !release.notes.isEmpty {
+                            Divider()
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Text("\(release.title) 릴리즈 노트")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                    Button("GitHub에서 열기") {
+                                        updater.openReleasePage(release)
+                                    }
+                                    .buttonStyle(.link)
+                                    .font(.caption)
+                                }
+                                Text(release.notes)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(6)
+                                    .padding(8)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+                            }
+                        }
+
+                        Divider()
+
+                        Toggle(isOn: $updater.autoCheckUpdates) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("앱 시작 시 자동으로 업데이트 확인")
+                                Text("GitHub 공개 릴리즈 API만 조회하며 어떠한 개인정보나 기기 정보도 전송하지 않습니다.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+
                 Section("디스크 접근 권한") {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
@@ -106,5 +168,67 @@ struct SettingsView: View {
             .formStyle(.grouped)
         }
         .onAppear { hasFDA = env.hasFullDiskAccess() }
+    }
+
+    @ViewBuilder
+    private var updateStatusBadge: some View {
+        switch updater.state {
+        case .idle:
+            StatusPill(text: "대기 중", color: .secondary)
+        case .checking:
+            StatusPill(text: "확인 중…", color: .blue, icon: "arrow.triangle.2.circlepath")
+        case .upToDate:
+            StatusPill(text: "최신 버전", color: .green, icon: "checkmark.circle.fill")
+        case .available(let release):
+            StatusPill(text: "\(release.tagName) 사용 가능", color: .blue, icon: "sparkles")
+        case .installing:
+            StatusPill(text: "설치 중…", color: .orange, icon: "arrow.down.circle.fill")
+        case .failed:
+            StatusPill(text: "확인 실패", color: .red, icon: "exclamationmark.triangle.fill")
+        }
+    }
+
+    private var updateSubtitleText: String {
+        switch updater.state {
+        case .idle:
+            return "GitHub Releases에서 새 버전 출시 여부를 확인할 수 있습니다."
+        case .checking:
+            return "GitHub에서 최신 릴리즈 정보를 확인하고 있습니다…"
+        case .upToDate:
+            return "현재 가장 최신 버전의 맥클린을 사용하고 있습니다."
+        case .available(let release):
+            return "새 버전(\(release.title))이 배포되었습니다. SHA-256 검증 후 자동으로 교체 및 재시작합니다."
+        case .installing(let status):
+            return status
+        case .failed(let message):
+            return message
+        }
+    }
+
+    @ViewBuilder
+    private var updateActionButtons: some View {
+        switch updater.state {
+        case .checking, .installing:
+            ProgressView().controlSize(.small)
+        case .available(let release):
+            HStack(spacing: 8) {
+                Button("다시 확인") {
+                    updater.checkForUpdates()
+                }
+                Button {
+                    updater.install(release)
+                } label: {
+                    Label("업데이트 설치 및 재시작", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.blue)
+            }
+        default:
+            Button {
+                updater.checkForUpdates()
+            } label: {
+                Label("지금 업데이트 확인", systemImage: "arrow.triangle.2.circlepath")
+            }
+        }
     }
 }

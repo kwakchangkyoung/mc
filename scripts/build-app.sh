@@ -5,7 +5,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
-version="${VERSION:-0.2.1}"
+version="${VERSION:-0.2.2}"
 arch_flags=()
 if [[ "${UNIVERSAL:-0}" == "1" ]]; then
     arch_flags=(--arch arm64 --arch x86_64)

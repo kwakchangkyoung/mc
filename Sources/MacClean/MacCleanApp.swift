@@ -104,6 +104,7 @@ struct RootView: View {
     @StateObject private var analyze = AnalyzeModel()
     @StateObject private var uninstall = UninstallModel()
     @StateObject private var optimize = OptimizeModel()
+    @StateObject private var updater = UpdateModel()
 
     var body: some View {
         NavigationSplitView {
@@ -114,8 +115,12 @@ struct RootView: View {
                     ForEach(PaneSection.allCases) { sec in
                         Section(sec.rawValue) {
                             ForEach(Pane.allCases.filter { $0.section == sec }) { p in
-                                SidebarRow(pane: p, isSelected: pane == p)
-                                    .tag(p)
+                                SidebarRow(
+                                    pane: p,
+                                    isSelected: pane == p,
+                                    hasBadge: p == .settings && updater.availableRelease != nil
+                                )
+                                .tag(p)
                             }
                         }
                     }
@@ -124,15 +129,22 @@ struct RootView: View {
             }
             .navigationSplitViewColumnWidth(min: 195, ideal: 210, max: 240)
         } detail: {
-            switch pane {
-            case .dashboard: DashboardView(model: status)
-            case .clean: CleanView(model: clean)
-            case .analyze: AnalyzeView(model: analyze)
-            case .uninstall: UninstallView(model: uninstall)
-            case .optimize: OptimizeView(model: optimize)
-            case .settings: SettingsView()
+            VStack(spacing: 0) {
+                if updater.shouldShowBanner, let release = updater.availableRelease, pane != .settings {
+                    UpdateBannerView(updater: updater, release: release)
+                    Divider()
+                }
+                switch pane {
+                case .dashboard: DashboardView(model: status)
+                case .clean: CleanView(model: clean)
+                case .analyze: AnalyzeView(model: analyze)
+                case .uninstall: UninstallView(model: uninstall)
+                case .optimize: OptimizeView(model: optimize)
+                case .settings: SettingsView(updater: updater)
+                }
             }
         }
+        .onAppear { updater.checkOnLaunchIfNeeded() }
     }
 
     private var sidebarBrandHeader: some View {
@@ -155,6 +167,7 @@ struct RootView: View {
 struct SidebarRow: View {
     let pane: Pane
     let isSelected: Bool
+    var hasBadge: Bool = false
 
     var body: some View {
         HStack(spacing: 9) {
@@ -169,6 +182,11 @@ struct SidebarRow: View {
             Text(pane.rawValue)
                 .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
             Spacer(minLength: 0)
+            if hasBadge {
+                Circle()
+                    .fill(isSelected ? Color.white : Color.blue)
+                    .frame(width: 7, height: 7)
+            }
         }
         .padding(.vertical, 2)
     }

@@ -42,6 +42,7 @@
   - [4. 앱 삭제 및 잔여물 정리](#4-앱-삭제-및-잔여물-정리)
   - [5. 시스템 진단 및 최적화](#5-시스템-진단-및-최적화)
   - [6. 다중 안전 장치 아키텍처](#6-다중-안전-장치-아키텍처)
+  - [7. 자동 업데이트 및 무결성 검증](#7-자동-업데이트-및-무결성-검증)
 - [설치 및 실행 방법](#설치-및-실행-방법)
   - [방법 1: GitHub Releases에서 다운로드 (권장)](#방법-1-github-releases에서-다운로드-권장)
   - [방법 2: 소스 코드에서 직접 빌드](#방법-2-소스-코드에서-직접-빌드)
@@ -154,6 +155,16 @@
 
 ---
 
+### 7. 자동 업데이트 및 무결성 검증
+
+GitHub Releases에 새 버전이 배포되면 앱 내에서 원클릭으로 안전하게 업데이트할 수 있습니다.
+
+- **자동 및 수동 버전 확인 (`ReleaseUpdater`)**: 앱 시작 시(설정에서 켜기/끄기 가능) 또는 `설정 → 소프트웨어 업데이트 → 지금 업데이트 확인` 버튼을 통해 GitHub 공개 API의 최신 릴리즈를 확인합니다.
+- **상단 업데이트 알림 배너**: 현재 버전보다 높은 시맨틱 버전(`vX.Y.Z`)이 출시되면 상단 배너와 사이드바 배지로 알려주며, 앱 내에서 바로 **변경 내역(릴리즈 노트)**을 확인할 수 있습니다.
+- **SHA-256 체크섬 검증 및 자동 재시작**: `지금 업데이트 및 재시작` 클릭 시 배포 패키지를 다운로드한 뒤 `SHA256SUMS.txt` 해시와 대조(`CryptoKit.SHA256`)하여 파일 무결성을 검증하고, 격리 속성(`com.apple.quarantine`) 해제 후 기존 `MacClean.app`을 안전하게 교체·재실행합니다.
+
+---
+
 ## 설치 및 실행 방법
 
 ### 시스템 요구 사항
@@ -166,7 +177,7 @@
 
 ### 방법 1: GitHub Releases에서 다운로드 (권장)
 
-1. [**GitHub Releases 페이지**](https://github.com/kwakchangkyoung/mc/releases)에서 최신 버전의 `MacClean-v0.2.1-macos.dmg` 또는 `MacClean-v0.2.1-macos.zip` 파일을 다운로드합니다.
+1. [**GitHub Releases 페이지**](https://github.com/kwakchangkyoung/mc/releases)에서 최신 버전의 `MacClean-v0.2.2-macos.dmg` 또는 `MacClean-v0.2.2-macos.zip` 파일을 다운로드합니다.
 2. **DMG 다운로드 시**: 디스크 이미지를 열고 `MacClean.app`을 `Applications`(`응용 프로그램`) 폴더로 드래그합니다.
 3. **ZIP 다운로드 시**: 압축을 풀고 `MacClean.app`을 `Applications` 폴더로 이동합니다.
 
@@ -240,8 +251,8 @@ BIN="build/MacClean.app/Contents/MacOS/MacClean"
 ### 1. Git 태그 푸시로 자동 배포 (GitHub Actions)
 
 ```bash
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.2.2
+git push origin v0.2.2
 ```
 
 GitHub Actions가 자동으로 단위 테스트를 거쳐 Universal 바이너리(`.dmg`, `.zip`, `SHA256SUMS.txt`)를 빌드하고 Release를 생성합니다.
@@ -250,14 +261,14 @@ GitHub Actions가 자동으로 단위 테스트를 거쳐 Universal 바이너리
 
 ```bash
 # 1. build/release/ 하위에 배포 파일 생성 (.dmg, .zip, SHA256SUMS.txt)
-./scripts/package-release.sh 0.2.1
+./scripts/package-release.sh 0.2.2
 
 # 2. GitHub CLI로 릴리즈 생성 및 파일 업로드
-gh release create v0.2.1 \
-  build/release/MacClean-v0.2.1-macos.dmg \
-  build/release/MacClean-v0.2.1-macos.zip \
+gh release create v0.2.2 \
+  build/release/MacClean-v0.2.2-macos.dmg \
+  build/release/MacClean-v0.2.2-macos.zip \
   build/release/SHA256SUMS.txt \
-  --title "MacClean v0.2.1" \
+  --title "MacClean v0.2.2" \
   --generate-notes
 ```
 
