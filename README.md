@@ -246,7 +246,7 @@ BIN="build/MacClean.app/Contents/MacOS/MacClean"
 
 ## GitHub 릴리즈 배포 가이드
 
-저장소의 릴리즈 패키징 스크립트([`scripts/package-release.sh`](scripts/package-release.sh))와 GitHub Actions 워크플로([`.github/workflows/release.yml`](.github/workflows/release.yml))를 통해 손쉽게 배포할 수 있습니다.
+저장소의 릴리즈 패키징 스크립트([`scripts/package-release.sh`](scripts/package-release.sh))와 GitHub Actions 워크플로([`.github/workflows/release.yml`](.github/workflows/release.yml))를 통해 손쉽게 배포할 수 있습니다. 자세한 수동/자동 릴리즈 절차와 재배포 관리 명령어는 [**릴리즈 가이드 (`docs/RELEASE.md`)**](docs/RELEASE.md)를 참고하세요.
 
 ### 1. Git 태그 푸시로 자동 배포 (GitHub Actions)
 
