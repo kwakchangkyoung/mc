@@ -29,9 +29,6 @@ public struct OptimizeEngine: Sendable {
         if whitelist.contains(task) {
             return OptimizeOutcome(task, .skipped, "화이트리스트에 등록됨")
         }
-        if task.requiresAdmin {
-            return OptimizeOutcome(task, .unavailable, "관리자 권한 필요 (특권 헬퍼 미설치)")
-        }
         switch task {
         case .cacheRefresh: return cacheRefresh(dryRun: dryRun, probes: probes)
         case .savedStateCleanup: return savedStateCleanup(dryRun: dryRun, probes: probes)
@@ -47,9 +44,11 @@ public struct OptimizeEngine: Sendable {
         case .launchAgentsCleanup: return launchAgentsCleanup()
         case .notificationCleanup: return notificationCleanup(dryRun: dryRun)
         case .coreduetCleanup: return coreduetCleanup(dryRun: dryRun)
-        case .networkOptimization, .networkStackOptimize, .diskPermissionsRepair,
-             .spotlightIndexOptimize, .periodicMaintenance:
-            return OptimizeOutcome(task, .unavailable, "관리자 권한 필요 (특권 헬퍼 미설치)")
+        case .networkOptimization: return networkOptimization()
+        case .networkStackOptimize: return networkStackOptimize()
+        case .diskPermissionsRepair: return diskPermissionsRepair()
+        case .spotlightIndexOptimize: return spotlightIndexOptimize()
+        case .periodicMaintenance: return periodicMaintenance()
         }
     }
 
@@ -602,5 +601,186 @@ public struct OptimizeEngine: Sendable {
         let vacuum = sqlite3(db, "VACUUM;", 20)
         let note = vacuum.status == 0 && !vacuum.timedOut ? "" : " (VACUUM 실패)"
         return OptimizeOutcome(.coreduetCleanup, .applied, "90일 지난 사용 기록 삭제" + note)
+    }
+
+    // MARK: admin tasks — Mole's read-only precondition checks
+    //
+    // The destructive half of these tasks (dscacheutil -flushcache, route -n flush,
+    // arp -a -d, mdutil -E, diskutil resetUserPermissions, periodic) is root-only and
+    // is never invoked here. Only the need-check probes run — identical for dry-run
+    // and real runs — so the report says whether the task would do anything at all.
+
+    /// Test seams for the admin probes (real paths/limits by default).
+    var periodicBinary = "/usr/sbin/periodic"
+    var periodicLog = "/var/log/daily.out"
+    var spotlightSlowThreshold: TimeInterval = 3
+    /// Mole calls bare `route`; its location moved between /usr/sbin and /sbin
+    /// across macOS versions, so resolve it like PATH unless a test pins it.
+    var routeBinary = ""
+
+    private var routeExe: String {
+        routeBinary.isEmpty
+            ? (["/usr/sbin/route", "/sbin/route"].first(where: FileStat.exists) ?? "/usr/sbin/route")
+            : routeBinary
+    }
+
+    /// Mole `has_active_vpn_interface` (tasks.sh:97-155): a "Connected" network
+    /// connection or a full-tunnel utun default route — bare utun* presence is
+    /// not enough (iCloud Private Relay, Continuity, #959).
+    private enum VPNState { case active, none, unknown }
+
+    private func vpnState() -> VPNState {
+        let nc = shell("/usr/sbin/scutil", ["--nc", "list"], 3)
+        if nc.timedOut || nc.status != 0 { return .unknown }
+        if nc.stdout.split(separator: "\n").contains(where: { $0.hasPrefix("* (Connected)") }) {
+            return .active
+        }
+        // Mole merges stderr; "not in table" means offline, i.e. provably no
+        // full-tunnel VPN, while other failures leave the state unknown
+        let route = shell("/bin/sh", ["-c", "\(routeExe) -n get default 2>&1"], 3)
+        if route.timedOut { return .unknown }
+        if route.status != 0 {
+            return route.stdout.contains("not in table") ? .none : .unknown
+        }
+        for line in route.stdout.split(separator: "\n") {
+            let parts = line.split(separator: ":", maxSplits: 1)
+            if parts.count == 2, parts[0].trimmingCharacters(in: .whitespaces) == "interface",
+               parts[1].trimmingCharacters(in: .whitespaces)
+                   .range(of: #"^utun[0-9]+$"#, options: .regularExpression) != nil {
+                return .active
+            }
+        }
+        return .none
+    }
+
+    /// tasks.sh opt_network_optimization — VPN gate + mDNSResponder label check.
+    /// Mole has no further need-check, so a passing check still needs the helper.
+    private func networkOptimization() -> OptimizeOutcome {
+        switch vpnState() {
+        case .active:
+            return OptimizeOutcome(.networkOptimization, .skipped, "VPN 사용 중 — 건너뜀")
+        case .unknown:
+            return OptimizeOutcome(.networkOptimization, .failed, "VPN 상태 확인 실패")
+        case .none: break
+        }
+        let r = shell("/usr/bin/plutil",
+                      ["-extract", "Label", "raw", "-o", "-",
+                       "/System/Library/LaunchDaemons/com.apple.mDNSResponder.plist"], 5)
+        let label = r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !r.timedOut, r.status == 0,
+              label == "com.apple.mDNSResponder" || label == "com.apple.mDNSResponder.reloaded"
+        else {
+            return OptimizeOutcome(.networkOptimization, .failed,
+                                   "mDNSResponder 레이블 확인 실패" + (label.isEmpty ? "" : " (\(label))"))
+        }
+        return OptimizeOutcome(.networkOptimization, .unavailable,
+                               "관리자 권한 필요 — DNS 플러시와 mDNSResponder 시그널은 root 전용 "
+                               + "(필요 여부 검사 없이 항상 실행되는 작업)")
+    }
+
+    /// tasks.sh opt_network_stack_optimize — flush only when route/DNS checks fail.
+    private func networkStackOptimize() -> OptimizeOutcome {
+        switch vpnState() {
+        case .active:
+            return OptimizeOutcome(.networkStackOptimize, .skipped, "VPN 사용 중 — 건너뜀")
+        case .unknown:
+            return OptimizeOutcome(.networkStackOptimize, .failed, "VPN 상태 확인 실패")
+        case .none: break
+        }
+        let route = shell(routeExe, ["-n", "get", "default"], 3)
+        let dns = shell("/usr/bin/dscacheutil", ["-q", "host", "-a", "name", "example.com"], 3)
+        if route.timedOut || dns.timedOut {
+            return OptimizeOutcome(.networkStackOptimize, .failed, "네트워크 상태 확인 타임아웃")
+        }
+        if route.status < 0 || route.status > 1 || dns.status < 0 || dns.status > 1 {
+            return OptimizeOutcome(.networkStackOptimize, .failed, "네트워크 상태 확인 실패")
+        }
+        if route.status == 0 && dns.status == 0 {
+            return OptimizeOutcome(.networkStackOptimize, .unchanged,
+                                   "필요 없음 — 라우팅·DNS 정상")
+        }
+        return OptimizeOutcome(.networkStackOptimize, .unavailable,
+                               "관리자 권한 필요 — 라우팅/DNS 오류 감지, 스택 재설정 필요")
+    }
+
+    /// tasks.sh opt_disk_permissions_repair / needs_permissions_repair — $HOME not
+    /// owned by $USER, or $HOME / ~/Library / ~/Library/Preferences not writable.
+    private func diskPermissionsRepair() -> OptimizeOutcome {
+        var st = stat()
+        var needs = stat(home, &st) == 0 && st.st_uid != getuid()
+        if !needs {
+            needs = [home, lib, lib + "/Preferences"].contains {
+                FileStat.exists($0) && access($0, W_OK) != 0
+            }
+        }
+        if needs {
+            return OptimizeOutcome(.diskPermissionsRepair, .unavailable,
+                                   "관리자 권한 필요 — 홈 권한 문제 감지 (diskutil resetUserPermissions)")
+        }
+        return OptimizeOutcome(.diskPermissionsRepair, .unchanged,
+                               "필요 없음 — 홈·Library·Preferences 소유·쓰기 정상")
+    }
+
+    /// tasks.sh opt_spotlight_index_optimize — rebuild only when the index is
+    /// enabled, on AC power, and two timed mdfind probes are both slow.
+    private func spotlightIndexOptimize() -> OptimizeOutcome {
+        let status = shell("/usr/bin/mdutil", ["-s", "/"], 3)
+        guard !status.timedOut, status.status == 0 else {
+            return OptimizeOutcome(.spotlightIndexOptimize, .failed, "Spotlight 상태 확인 실패")
+        }
+        let out = status.stdout
+        if out.localizedCaseInsensitiveContains("Indexing disabled") {
+            return OptimizeOutcome(.spotlightIndexOptimize, .skipped, "Spotlight 인덱싱이 꺼져 있음")
+        }
+        guard out.localizedCaseInsensitiveContains("Indexing enabled"),
+              !out.localizedCaseInsensitiveContains("Indexing and searching disabled") else {
+            return OptimizeOutcome(.spotlightIndexOptimize, .unchanged, "Spotlight 상태 확인됨")
+        }
+        // Mole: a rebuild is only offered on AC power — skip the probe on battery
+        let batt = shell("/usr/bin/pmset", ["-g", "batt"], 3)
+        guard batt.stdout.contains("AC Power") else {
+            return OptimizeOutcome(.spotlightIndexOptimize, .skipped,
+                                   "배터리 사용 중 — 인덱스 재구축 건너뜀")
+        }
+        var slow = 0, probeFailed = 0
+        for probe in 0..<2 {
+            let start = Date()
+            let r = shell("/usr/bin/mdfind", ["kMDItemFSName == 'Applications'"], 5)
+            let elapsed = Date().timeIntervalSince(start)
+            if r.timedOut { slow += 1 }                    // a timeout counts as slow (Mole)
+            else if r.status != 0 { probeFailed += 1 }
+            else if elapsed > spotlightSlowThreshold { slow += 1 }
+            if probe == 0 { Thread.sleep(forTimeInterval: 1) }
+        }
+        if probeFailed > 0 {
+            return OptimizeOutcome(.spotlightIndexOptimize, .failed,
+                                   "Spotlight 속도 측정 실패 (\(probeFailed)개 프로브)")
+        }
+        if slow >= 2 {
+            return OptimizeOutcome(.spotlightIndexOptimize, .unavailable,
+                                   "관리자 권한 필요 — Spotlight 검색이 느림, 인덱스 재구축 필요")
+        }
+        return OptimizeOutcome(.spotlightIndexOptimize, .unchanged,
+                               "필요 없음 — Spotlight 검색 정상")
+    }
+
+    /// tasks.sh opt_periodic_maintenance — periodic was removed in macOS 26.
+    /// File existence replaces `command -v` so every probe stays a fixed argv;
+    /// a missing daily.out log counts as stale.
+    private func periodicMaintenance() -> OptimizeOutcome {
+        guard FileStat.exists(periodicBinary) else {
+            return OptimizeOutcome(.periodicMaintenance, .unavailable, "이 macOS에서 지원 안 함")
+        }
+        if let mtime = FileStat.modificationDate(periodicLog) {
+            let days = max(0, Int(Date().timeIntervalSince(mtime) / 86_400))
+            if days < 7 {
+                return OptimizeOutcome(.periodicMaintenance, .unchanged,
+                                       "필요 없음 — 유지보수가 \(days)일 전에 실행됨")
+            }
+            return OptimizeOutcome(.periodicMaintenance, .unavailable,
+                                   "관리자 권한 필요 — 마지막 유지보수 \(days)일 전")
+        }
+        return OptimizeOutcome(.periodicMaintenance, .unavailable,
+                               "관리자 권한 필요 — 유지보수 실행 기록 없음")
     }
 }

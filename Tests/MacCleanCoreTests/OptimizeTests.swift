@@ -106,9 +106,11 @@ private final class Recorder: @unchecked Sendable {
         let engine = makeEngine(home: home) { e, a, _ in
             recorder.calls.append((e, a)); return .init(status: 0, stdout: "", timedOut: false)
         }
+        // read-only need-check probes are allowed; the task must never claim or
+        // attempt a privileged/destructive operation
         let outcome = engine.run(task, dryRun: false, probes: idleProbes)
-        #expect(outcome.kind == .unavailable)
-        #expect(recorder.calls.isEmpty)
+        #expect(outcome.kind != .applied)
+        expectReadOnly(recorder.calls)
     }
 
     @Test func dryRunDeletesNothing() throws {
@@ -397,5 +399,283 @@ private final class Recorder: @unchecked Sendable {
         let findings = OptimizeDiagnostics.run(shell: shell)
         #expect(findings.contains { $0.contains("My App") })
         #expect(!findings.contains { $0.contains("WindowServer") })
+    }
+}
+
+// MARK: - admin tasks: Mole read-only precondition checks
+
+/// The 5 admin tasks may only run read-only probes — record every argv and
+/// assert none of the destructive halves (flush/reset/rebuild/periodic) appear.
+private func expectReadOnly(_ calls: [(String, [String])]) {
+    for (exe, args) in calls {
+        let argv = ([exe] + args).joined(separator: " ")
+        #expect(!argv.contains("sudo"))
+        #expect(!argv.contains("osascript"))
+        #expect(!argv.contains("-flushcache"))
+        #expect(!argv.contains("resetUserPermissions"))
+        #expect(!(exe.hasSuffix("route") && args.contains("flush")))
+        #expect(!exe.hasSuffix("arp"))
+        #expect(!(exe.hasSuffix("mdutil") && args.contains("-E")))
+        #expect(!exe.hasSuffix("periodic"))
+        if exe == "/bin/sh" {
+            let script = args.joined(separator: " ")
+            #expect(!script.contains("flush") && !script.contains("sudo")
+                    && !script.contains("periodic"))
+        }
+    }
+}
+
+private func adminShell(_ responses: [String: Shell.Result]) -> (Recorder, OptimizeEngine.Runner) {
+    let recorder = Recorder()
+    let runner: OptimizeEngine.Runner = { e, a, _ in
+        recorder.calls.append((e, a))
+        return responses[e + " " + a.joined(separator: " ")]
+            ?? .init(status: 0, stdout: "", timedOut: false)
+    }
+    return (recorder, runner)
+}
+
+/// scutil clean + a utun default route = active full-tunnel VPN (Mole's route probe
+/// is invoked via sh -c so stderr merges into stdout, matching Mole's 2>&1).
+private let vpnActive: [String: Shell.Result] = [
+    "/usr/sbin/scutil --nc list": .init(status: 0, stdout:
+        "* (Connected)      ABCD-1 IKEv2 \"Corp VPN\"\n", timedOut: false),
+    "/bin/sh -c /usr/sbin/route -n get default 2>&1": .init(status: 0, stdout:
+        "   route to: default\ndestination: default\n    gateway: 10.0.0.1\n  interface: utun3\n", timedOut: false),
+]
+/// scutil clean + an en0 default route = no VPN.
+private let vpnNone: [String: Shell.Result] = [
+    "/usr/sbin/scutil --nc list": .init(status: 0, stdout:
+        "  (Disconnected)   ABCD-1 IKEv2 \"VPN\"\n", timedOut: false),
+    "/bin/sh -c /usr/sbin/route -n get default 2>&1": .init(status: 0, stdout:
+        "   route to: default\ndestination: default\n    gateway: 192.168.0.1\n  interface: en0\n", timedOut: false),
+]
+
+@Suite struct AdminTaskTests {
+    private func engine(_ runner: @escaping OptimizeEngine.Runner, home: String = "") throws -> OptimizeEngine {
+        var e = makeEngine(home: try home.isEmpty ? makeTempDir() : home, shell: runner)
+        e.routeBinary = "/usr/sbin/route"  // pin so fake-runner keys stay machine-independent
+        return e
+    }
+
+    // network_optimization — VPN gate, then mDNSResponder label, then always needs root
+    @Test func networkOptSkipsOnActiveVPN() throws {
+        let (rec, runner) = adminShell(vpnActive)
+        let o = try engine(runner).run(.networkOptimization, dryRun: false, probes: idleProbes)
+        #expect(o.kind == .skipped)
+        #expect(o.message.contains("VPN"))
+        expectReadOnly(rec.calls)
+    }
+
+    @Test func networkOptFailsOnUnknownVPN() throws {
+        let (rec, runner) = adminShell([
+            "/usr/sbin/scutil --nc list": .init(status: 1, stdout: "", timedOut: false),
+        ])
+        let o = try engine(runner).run(.networkOptimization, dryRun: true, probes: idleProbes)
+        #expect(o.kind == .failed)
+        expectReadOnly(rec.calls)
+    }
+
+    @Test func networkOptAdminRequiredAfterChecks() throws {
+        var r = vpnNone
+        r["/usr/bin/plutil -extract Label raw -o - /System/Library/LaunchDaemons/com.apple.mDNSResponder.plist"] =
+            .init(status: 0, stdout: "com.apple.mDNSResponder\n", timedOut: false)
+        let (rec, runner) = adminShell(r)
+        let o = try engine(runner).run(.networkOptimization, dryRun: false, probes: idleProbes)
+        #expect(o.kind == .unavailable)
+        #expect(o.message.contains("관리자 권한 필요"))
+        expectReadOnly(rec.calls)
+    }
+
+    @Test func networkOptFailsOnUnexpectedLabel() throws {
+        var r = vpnNone
+        r["/usr/bin/plutil -extract Label raw -o - /System/Library/LaunchDaemons/com.apple.mDNSResponder.plist"] =
+            .init(status: 0, stdout: "com.evil.responder\n", timedOut: false)
+        let (rec, runner) = adminShell(r)
+        let o = try engine(runner).run(.networkOptimization, dryRun: true, probes: idleProbes)
+        #expect(o.kind == .failed)
+        expectReadOnly(rec.calls)
+    }
+
+    // network_stack_optimize — VPN gate, then route/DNS health probes
+    @Test func networkStackSkipsOnActiveVPN() throws {
+        let (rec, runner) = adminShell(vpnActive)
+        let o = try engine(runner).run(.networkStackOptimize, dryRun: false, probes: idleProbes)
+        #expect(o.kind == .skipped)
+        expectReadOnly(rec.calls)
+    }
+
+    @Test func networkStackUnchangedWhenHealthy() throws {
+        var r = vpnNone
+        r["/usr/sbin/route -n get default"] = .init(status: 0, stdout: "  interface: en0\n", timedOut: false)
+        r["/usr/bin/dscacheutil -q host -a name example.com"] = .init(status: 0, stdout: "ip_address: 1.2.3.4\n", timedOut: false)
+        let (rec, runner) = adminShell(r)
+        let o = try engine(runner).run(.networkStackOptimize, dryRun: true, probes: idleProbes)
+        #expect(o.kind == .unchanged)
+        #expect(o.message.contains("필요 없음"))
+        expectReadOnly(rec.calls)
+    }
+
+    @Test func networkStackAdminRequiredWhenRouteBroken() throws {
+        var r = vpnNone
+        r["/usr/sbin/route -n get default"] = .init(status: 1, stdout: "", timedOut: false)
+        r["/usr/bin/dscacheutil -q host -a name example.com"] = .init(status: 0, stdout: "", timedOut: false)
+        let (rec, runner) = adminShell(r)
+        let o = try engine(runner).run(.networkStackOptimize, dryRun: false, probes: idleProbes)
+        #expect(o.kind == .unavailable)
+        #expect(o.message.contains("관리자 권한 필요"))
+        expectReadOnly(rec.calls)
+    }
+
+    @Test func networkStackFailsOnTimeout() throws {
+        var r = vpnNone
+        r["/usr/sbin/route -n get default"] = .init(status: 124, stdout: "", timedOut: true)
+        let (rec, runner) = adminShell(r)
+        let o = try engine(runner).run(.networkStackOptimize, dryRun: true, probes: idleProbes)
+        #expect(o.kind == .failed)
+        expectReadOnly(rec.calls)
+    }
+
+    // disk_permissions_repair — stat/access are direct syscalls, no commands at all
+    @Test func diskPermsUnchangedWhenHealthy() throws {
+        let home = try makeTempDir()
+        try mkdir(home + "/Library/Preferences")
+        let (rec, runner) = adminShell([:])
+        let o = makeEngine(home: home, shell: runner)
+            .run(.diskPermissionsRepair, dryRun: false, probes: idleProbes)
+        #expect(o.kind == .unchanged)
+        #expect(o.message.contains("필요 없음"))
+        #expect(rec.calls.isEmpty)
+    }
+
+    @Test func diskPermsAdminRequiredWhenUnwritable() throws {
+        let home = try makeTempDir()
+        try mkdir(home + "/Library/Preferences")
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: home)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: home) }
+        let (rec, runner) = adminShell([:])
+        let o = makeEngine(home: home, shell: runner)
+            .run(.diskPermissionsRepair, dryRun: true, probes: idleProbes)
+        #expect(o.kind == .unavailable)
+        #expect(o.message.contains("관리자 권한 필요"))
+        expectReadOnly(rec.calls)
+    }
+
+    // spotlight_index_optimize — mdutil state, battery gate, two timed mdfind probes
+    @Test func spotlightSkippedWhenIndexingDisabled() throws {
+        let (rec, runner) = adminShell([
+            "/usr/bin/mdutil -s /": .init(status: 0, stdout: "/:\n\tIndexing disabled.\n", timedOut: false),
+        ])
+        let o = try engine(runner).run(.spotlightIndexOptimize, dryRun: false, probes: idleProbes)
+        #expect(o.kind == .skipped)
+        expectReadOnly(rec.calls)
+    }
+
+    @Test func spotlightSkippedOnBattery() throws {
+        let (rec, runner) = adminShell([
+            "/usr/bin/mdutil -s /": .init(status: 0, stdout: "/:\n\tIndexing enabled.\n", timedOut: false),
+            "/usr/bin/pmset -g batt": .init(status: 0, stdout: "Now drawing from 'Battery Power'\n", timedOut: false),
+        ])
+        let o = try engine(runner).run(.spotlightIndexOptimize, dryRun: true, probes: idleProbes)
+        #expect(o.kind == .skipped)
+        expectReadOnly(rec.calls)
+    }
+
+    @Test func spotlightUnchangedWhenProbesFast() throws {
+        let (rec, runner) = adminShell([
+            "/usr/bin/mdutil -s /": .init(status: 0, stdout: "/:\n\tIndexing enabled.\n", timedOut: false),
+            "/usr/bin/pmset -g batt": .init(status: 0, stdout: "Now drawing from 'AC Power'\n", timedOut: false),
+        ])
+        let o = try engine(runner).run(.spotlightIndexOptimize, dryRun: false, probes: idleProbes)
+        #expect(o.kind == .unchanged)
+        #expect(o.message.contains("필요 없음"))
+        expectReadOnly(rec.calls)
+    }
+
+    @Test func spotlightAdminRequiredWhenBothProbesTimeout() throws {
+        let (rec, runner) = adminShell([
+            "/usr/bin/mdutil -s /": .init(status: 0, stdout: "/:\n\tIndexing enabled.\n", timedOut: false),
+            "/usr/bin/pmset -g batt": .init(status: 0, stdout: "Now drawing from 'AC Power'\n", timedOut: false),
+            "/usr/bin/mdfind kMDItemFSName == 'Applications'": .init(status: 124, stdout: "", timedOut: true),
+        ])
+        let o = try engine(runner).run(.spotlightIndexOptimize, dryRun: true, probes: idleProbes)
+        #expect(o.kind == .unavailable)
+        #expect(o.message.contains("관리자 권한 필요"))
+        expectReadOnly(rec.calls)
+    }
+
+    @Test func spotlightAdminRequiredWhenProbesSlow() throws {
+        let (rec, runner) = adminShell([
+            "/usr/bin/mdutil -s /": .init(status: 0, stdout: "/:\n\tIndexing enabled.\n", timedOut: false),
+            "/usr/bin/pmset -g batt": .init(status: 0, stdout: "Now drawing from 'AC Power'\n", timedOut: false),
+        ])
+        var e = try engine(runner)
+        e.spotlightSlowThreshold = 0  // any measurable duration counts as slow
+        let o = e.run(.spotlightIndexOptimize, dryRun: false, probes: idleProbes)
+        #expect(o.kind == .unavailable)
+        expectReadOnly(rec.calls)
+    }
+
+    @Test func spotlightFailsWhenProbeErrors() throws {
+        let (rec, runner) = adminShell([
+            "/usr/bin/mdutil -s /": .init(status: 0, stdout: "/:\n\tIndexing enabled.\n", timedOut: false),
+            "/usr/bin/pmset -g batt": .init(status: 0, stdout: "Now drawing from 'AC Power'\n", timedOut: false),
+            "/usr/bin/mdfind kMDItemFSName == 'Applications'": .init(status: 1, stdout: "", timedOut: false),
+        ])
+        let o = try engine(runner).run(.spotlightIndexOptimize, dryRun: true, probes: idleProbes)
+        #expect(o.kind == .failed)
+        expectReadOnly(rec.calls)
+    }
+
+    @Test func spotlightFailsWhenMdutilErrors() throws {
+        let (rec, runner) = adminShell([
+            "/usr/bin/mdutil -s /": .init(status: 1, stdout: "", timedOut: false),
+        ])
+        let o = try engine(runner).run(.spotlightIndexOptimize, dryRun: false, probes: idleProbes)
+        #expect(o.kind == .failed)
+        expectReadOnly(rec.calls)
+    }
+
+    // periodic_maintenance — tool existence + daily.out mtime (direct file checks)
+    @Test func periodicUnsupportedWhenToolMissing() throws {
+        var e = try engine { _, _, _ in .init(status: 0, stdout: "", timedOut: false) }
+        e.periodicBinary = "/nonexistent/periodic"
+        let o = e.run(.periodicMaintenance, dryRun: false, probes: idleProbes)
+        #expect(o.kind == .unavailable)
+        #expect(o.message.contains("이 macOS에서 지원 안 함"))
+    }
+
+    @Test func periodicUnchangedWhenLogFresh() throws {
+        let home = try makeTempDir()
+        try touch(home + "/daily.out")
+        var e = try engine({ _, _, _ in .init(status: 0, stdout: "", timedOut: false) }, home: home)
+        e.periodicBinary = "/bin/sh"  // any existing file stands in for the tool
+        e.periodicLog = home + "/daily.out"
+        let o = e.run(.periodicMaintenance, dryRun: true, probes: idleProbes)
+        #expect(o.kind == .unchanged)
+        #expect(o.message.contains("필요 없음"))
+    }
+
+    @Test func periodicAdminRequiredWhenLogStale() throws {
+        let home = try makeTempDir()
+        try touch(home + "/daily.out")
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-30 * 86_400)], ofItemAtPath: home + "/daily.out")
+        var e = try engine({ _, _, _ in .init(status: 0, stdout: "", timedOut: false) }, home: home)
+        e.periodicBinary = "/bin/sh"
+        e.periodicLog = home + "/daily.out"
+        let o = e.run(.periodicMaintenance, dryRun: false, probes: idleProbes)
+        #expect(o.kind == .unavailable)
+        #expect(o.message.contains("관리자 권한 필요"))
+    }
+
+    @Test func periodicAdminRequiredWhenLogMissing() throws {
+        let home = try makeTempDir()
+        var e = try engine({ _, _, _ in .init(status: 0, stdout: "", timedOut: false) }, home: home)
+        e.periodicBinary = "/bin/sh"
+        e.periodicLog = home + "/daily.out"
+        let o = e.run(.periodicMaintenance, dryRun: true, probes: idleProbes)
+        #expect(o.kind == .unavailable)
+        #expect(o.message.contains("관리자 권한 필요"))
     }
 }

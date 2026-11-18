@@ -7,6 +7,8 @@ final class OptimizeModel: ObservableObject {
     @Published var diagnosing = false
     @Published var selected: Set<OptimizeTask> = Set(OptimizeTask.allCases.filter { !$0.requiresAdmin })
     @Published var results: [OptimizeTask: OptimizeOutcome] = [:]
+    /// Read-only precondition outcomes for admin tasks, refreshed by diagnose().
+    @Published var adminOutcomes: [OptimizeTask: OptimizeOutcome] = [:]
     @Published var running = false
     @Published var error: String?
 
@@ -35,6 +37,16 @@ final class OptimizeModel: ObservableObject {
             diagnostics = await Task.detached(priority: .userInitiated) {
                 OptimizeDiagnostics.run()
             }.value
+            // admin tasks only get read-only need checks — identical to a dry run
+            if let engine = try? AppEnvironment.current.makeOptimizeEngine() {
+                let probes = await Task.detached(priority: .userInitiated) { ProbeContext.capture() }.value
+                for task in OptimizeTask.allCases where task.requiresAdmin {
+                    let outcome = await Task.detached(priority: .utility) {
+                        engine.run(task, dryRun: true, probes: probes)
+                    }.value
+                    adminOutcomes[task] = outcome
+                }
+            }
             diagnosing = false
         }
     }
@@ -178,14 +190,14 @@ struct OptimizeView: View {
                     Text(task.title)
                         .fontWeight(.medium)
                         .foregroundStyle(task.requiresAdmin ? Color.secondary : Color.primary)
-                    if task.requiresAdmin {
+                    if task.requiresAdmin, model.adminOutcomes[task] == nil {
                         StatusPill(text: "관리자 권한 필요", color: .secondary, icon: "lock.fill")
                     }
                 }
                 Text(task.detail)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                if let outcome = model.results[task] {
+                if let outcome = model.results[task] ?? model.adminOutcomes[task] {
                     HStack(spacing: 6) {
                         StatusPill(
                             text: outcome.kind.koreanLabel,
