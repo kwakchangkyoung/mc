@@ -36,8 +36,11 @@ public struct SafeDeleter: Sendable {
     /// Validation shared by scan (dry-run) and execution.
     /// `forUninstall` matches Mole `MOLE_UNINSTALL_MODE=1`: the user whitelist is not applied
     /// and path protection uses the uninstall rules (system-critical only).
-    public func check(_ path: String, probes: ProbeContext, forUninstall: Bool = false) -> Refusal? {
-        if let r = policy.validate(path, probes: probes, uninstall: forUninstall) { return r }
+    /// `allowance` carries a rule-scoped protection exception (see `PathAllowance`).
+    public func check(_ path: String, probes: ProbeContext, forUninstall: Bool = false,
+                      allowance: PathAllowance = .none) -> Refusal? {
+        if let r = policy.validate(path, probes: probes, uninstall: forUninstall,
+                                   allowance: allowance) { return r }
         if !forUninstall && whitelist.contains(path) { return .whitelist }
         if ProtectionPolicy.holdsCompiledModelCache(path) { return .compiledModelCache }
         return nil
@@ -45,9 +48,10 @@ public struct SafeDeleter: Sendable {
 
     public func remove(_ path: String, expected: PathIdentity?, dryRun: Bool, probes: ProbeContext,
                        sizeDeadline: Date = Date().addingTimeInterval(30),
+                       allowance: PathAllowance = .none,
                        command customCommand: String? = nil) -> DeleteOutcome {
         let command = customCommand ?? (dryRun ? "clean-dry-run" : "clean")
-        if let refusal = check(path, probes: probes) {
+        if let refusal = check(path, probes: probes, allowance: allowance) {
             log?.record(command, "SKIPPED", path, refusal.rawValue)
             return .skipped(refusal)
         }
@@ -80,9 +84,11 @@ public struct SafeDeleter: Sendable {
     /// Same `check` validation as `remove`; if trashing fails there is NO permanent-delete
     /// fallback (DESIGN principle 2).
     public func trash(_ path: String, expected: PathIdentity?, probes: ProbeContext,
-                      forUninstall: Bool = false) -> DeleteOutcome {
+                      forUninstall: Bool = false,
+                      allowance: PathAllowance = .none) -> DeleteOutcome {
         let command = forUninstall ? "uninstall" : "trash"
-        if let refusal = check(path, probes: probes, forUninstall: forUninstall) {
+        if let refusal = check(path, probes: probes, forUninstall: forUninstall,
+                               allowance: allowance) {
             log?.record(command, "SKIPPED", path, refusal.rawValue)
             return .skipped(refusal)
         }

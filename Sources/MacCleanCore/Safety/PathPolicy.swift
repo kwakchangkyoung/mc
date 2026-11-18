@@ -19,6 +19,15 @@ public enum Refusal: String, Sendable, Error {
     case identityChanged = "identity changed"
     case processRunning = "app running"
     case processUnknown = "process state unknown"
+    case inUse = "in use"
+}
+
+/// Rule-scoped exceptions to path protection. `.aerialVideos` lifts the
+/// com.apple.wallpaper protection ONLY for regular `.mov` files directly inside
+/// `aerials/videos/` — dirs, symlinks and anything else under the tree stay refused.
+public enum PathAllowance: Sendable {
+    case none
+    case aerialVideos
 }
 
 /// Live-state snapshots used by validation (replaces Mole's pgrep/ps/lsof probes).
@@ -137,7 +146,9 @@ public struct PathPolicy: Sendable {
 
     /// Returns nil when the path may be deleted.
     /// `uninstall` selects Mole `MOLE_UNINSTALL_MODE` protection rules (system-critical only).
-    public func validate(_ rawPath: String, probes: ProbeContext, uninstall: Bool = false) -> Refusal? {
+    /// `allowance` carries a rule-scoped exception (see `PathAllowance`).
+    public func validate(_ rawPath: String, probes: ProbeContext, uninstall: Bool = false,
+                         allowance: PathAllowance = .none) -> Refusal? {
         if rawPath.isEmpty { return .emptyPath }
         if !rawPath.hasPrefix("/") { return .notAbsolute }
         if rawPath.split(separator: "/", omittingEmptySubsequences: false).contains("..") { return .parentTraversal }
@@ -155,11 +166,22 @@ public struct PathPolicy: Sendable {
             if Self.isCritical(Self.normalize(abs)) { return .symlinkToCritical }
         }
 
+        let aerialVideo = allowance == .aerialVideos && isAerialVideoFile(path, under: home)
+
         // ancestor symlink: re-check the physical path (refusal only)
         let parent = (path as NSString).deletingLastPathComponent
         if hasSymlinkAncestor(parent), let physicalParent = FileStat.realPath(parent) {
             let physical = Self.normalize(physicalParent + "/" + (path as NSString).lastPathComponent)
-            if Self.isCritical(physical) || protection.shouldProtectPath(physical) { return .ancestorSymlinkProtected }
+            // the allowance must hold for the PHYSICAL path, resolved against $HOME
+            // itself only — a symlinked videos dir or ancestor resolves elsewhere
+            // (another app's data dir) and falls back to the normal refusal
+            let physicalAerial = aerialVideo
+                && isAerialVideoFile(physical, under: FileStat.realPath(home) ?? home)
+            if aerialVideo && !physicalAerial { return .ancestorSymlinkProtected }
+            if Self.isCritical(physical)
+                || (!physicalAerial && protection.shouldProtectPath(physical)) {
+                return .ancestorSymlinkProtected
+            }
         }
 
         if path == "/System/Library/Caches/com.apple.coresymbolicationd/data"
@@ -188,8 +210,19 @@ public struct PathPolicy: Sendable {
         // ~/.Trash/<top> skips protection; everything else goes through should_protect_path
         let trash = home + "/.Trash/"
         let isTrashTop = path.hasPrefix(trash) && !path.dropFirst(trash.count).contains("/")
-        if !isTrashTop && protection.shouldProtectPath(path, uninstall: uninstall) { return .protected }
+        if !isTrashTop && !aerialVideo
+            && protection.shouldProtectPath(path, uninstall: uninstall) { return .protected }
         return nil
+    }
+
+    /// `<homeRoot>/Library/Application Support/com.apple.wallpaper/aerials/videos/<name>.mov`,
+    /// a regular file only.
+    private func isAerialVideoFile(_ path: String, under homeRoot: String) -> Bool {
+        let dir = AerialVideos.videosDir(ofHome: homeRoot) + "/"
+        guard path.hasPrefix(dir), path.hasSuffix(".mov") else { return false }
+        let name = String(path.dropFirst(dir.count))
+        guard !name.isEmpty, !name.contains("/") else { return false }
+        return FileStat.exists(path) && !FileStat.isSymlink(path) && !FileStat.isDirectory(path)
     }
 
     private func hasSymlinkAncestor(_ start: String) -> Bool {

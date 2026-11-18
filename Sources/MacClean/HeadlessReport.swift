@@ -44,9 +44,11 @@ enum HeadlessReport {
                 print("## \(group.rule.label): deferred (\(d.rawValue))")
                 continue
             }
-            guard !group.items.isEmpty || !group.skipped.isEmpty else { continue }
+            guard !group.items.isEmpty || !group.skipped.isEmpty || group.note != nil else { continue }
             print("## \(group.rule.label): \(ByteFormat.string(group.totalBytes, partial: group.partial)) "
                   + "\(group.items.count) items, \(group.skipped.count) skipped")
+            if let note = group.note { print("  NOTE \(note)") }
+            for a in group.inUseAssets { print("  INUSE \(a)") }
             for item in group.items { print("  \(item.path)\t\(item.size.bytes)") }
             for s in group.skipped { print("  SKIP \(s.path)\t\(s.reason.rawValue)") }
         }

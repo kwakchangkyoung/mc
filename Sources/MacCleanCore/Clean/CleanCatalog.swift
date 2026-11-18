@@ -33,11 +33,18 @@ public struct CleanRule: Sendable, Identifiable {
     public var whenNotRunning: RunningGuard?
     /// Mole sweep of sandbox containers: skip bundles protected by `should_protect_data`.
     public var skipProtectedContainerOwners = false
+    /// Opt-in rules stay unchecked until the user selects them.
+    public var defaultSelected = true
+    /// Move to Trash instead of permanent delete (never falls back).
+    public var trashOnly = false
+    /// Rule-scoped protection exception (see `PathAllowance`).
+    public var allowance: PathAllowance = .none
     public var source: String
 
     public init(_ section: CleanSection, _ label: String, _ patterns: [String], source: String,
                 excludeNames: [String] = [], minAgeDays: Double? = nil, whenNotRunning: RunningGuard? = nil,
-                skipProtectedContainerOwners: Bool = false) {
+                skipProtectedContainerOwners: Bool = false, defaultSelected: Bool = true,
+                trashOnly: Bool = false, allowance: PathAllowance = .none) {
         self.section = section
         self.label = label
         self.patterns = patterns
@@ -46,6 +53,9 @@ public struct CleanRule: Sendable, Identifiable {
         self.minAgeDays = minAgeDays
         self.whenNotRunning = whenNotRunning
         self.skipProtectedContainerOwners = skipProtectedContainerOwners
+        self.defaultSelected = defaultSelected
+        self.trashOnly = trashOnly
+        self.allowance = allowance
     }
 }
 
@@ -201,5 +211,10 @@ public enum CleanCatalog {
         ], source: "app_caches.sh:1106-1140",
            whenNotRunning: RunningGuard(bundleIDs: ["com.hnc.Discord", "com.tinyspeck.slackmacgap"],
                                         names: ["Discord", "Slack"])),
+        // Opt-in: downloaded aerial wallpapers. Candidates come from AerialVideos
+        // (in-use assets excluded), deletions go to Trash, and only regular .mov
+        // files inside aerials/videos/ get past the wallpaper protection.
+        CleanRule(.apps, "Aerial wallpaper videos", [], source: "custom",
+                  defaultSelected: false, trashOnly: true, allowance: .aerialVideos),
     ]
 }

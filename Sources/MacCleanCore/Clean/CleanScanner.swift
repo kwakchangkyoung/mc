@@ -19,6 +19,10 @@ public struct CleanGroup: Sendable, Identifiable {
     public var skipped: [(path: String, reason: Refusal)]
     /// Set when the whole rule was deferred (guarded app running or state unknown).
     public var deferred: Refusal?
+    /// Optional per-scan explanation shown under the group (opt-in notes, fail-closed reasons).
+    public var note: String?
+    /// assetIDs in use by the current wallpaper configuration (aerial videos rule).
+    public var inUseAssets: [String] = []
 
     public var totalBytes: Int64 { items.reduce(0) { $0 + $1.size.bytes } }
     public var partial: Bool { items.contains { $0.size.partial } }
@@ -72,11 +76,34 @@ public struct CleanEngine: Sendable {
                 }
             }
             if group.deferred == nil {
-                for path in candidates(for: rule) where claimed.insert(path).inserted {
-                    if let refusal = deleter.check(path, probes: probes) {
-                        group.skipped.append((path, refusal))
+                if rule.allowance == .aerialVideos {
+                    let aerial = AerialVideos.scan(home: home)
+                    group.inUseAssets = aerial.inUseAssetIDs.sorted()
+                    if let reason = aerial.unavailableReason {
+                        group.note = "사용할 수 없습니다 — \(reason)"
                     } else {
-                        pending.append((groups.count, path))
+                        for path in aerial.cleanable where claimed.insert(path).inserted {
+                            if let refusal = deleter.check(path, probes: probes,
+                                                           allowance: rule.allowance) {
+                                group.skipped.append((path, refusal))
+                            } else {
+                                pending.append((groups.count, path))
+                            }
+                        }
+                        for path in aerial.inUseFiles { group.skipped.append((path, .inUse)) }
+                        var note = "사용 중인 영상은 제외합니다. 휴지통을 비워야 공간이 확보됩니다."
+                        if aerial.shuffleOn {
+                            note += " 순환(무작위) 설정이 켜져 있어 지운 영상을 macOS가 다시 내려받을 수 있습니다."
+                        }
+                        group.note = note
+                    }
+                } else {
+                    for path in candidates(for: rule) where claimed.insert(path).inserted {
+                        if let refusal = deleter.check(path, probes: probes) {
+                            group.skipped.append((path, refusal))
+                        } else {
+                            pending.append((groups.count, path))
+                        }
                     }
                 }
             }
@@ -131,7 +158,8 @@ public struct CleanEngine: Sendable {
         }
         for ruleID in order {
             let probes = captureProbes()
-            if let g = lookup[ruleID]?.whenNotRunning {
+            let rule = lookup[ruleID]
+            if let g = rule?.whenNotRunning {
                 let state = probes.processes.state(bundleIDs: g.bundleIDs, names: g.names)
                 if state != .notRunning {
                     let reason = state == .running ? Refusal.processRunning : Refusal.processUnknown
@@ -141,10 +169,38 @@ public struct CleanEngine: Sendable {
                     continue
                 }
             }
-            for item in byRule[ruleID] ?? [] {
+            var deletables = byRule[ruleID] ?? []
+            if rule?.allowance == .aerialVideos {
+                // re-read the in-use set right before deleting: a wallpaper change
+                // after the scan must not lose its videos, and an unreadable config
+                // fails closed the same way the scan did
+                let aerial = AerialVideos.scan(home: home)
+                if aerial.unavailableReason != nil {
+                    for item in deletables { result.skipped.append((item.path, Refusal.inUse.rawValue)) }
+                    continue
+                }
+                deletables = deletables.filter { item in
+                    let assetID = (item.path as NSString).deletingPathExtension
+                        .components(separatedBy: "/").last ?? ""
+                    if aerial.inUseAssetIDs.contains(assetID) {
+                        result.skipped.append((item.path, Refusal.inUse.rawValue))
+                        return false
+                    }
+                    return true
+                }
+            }
+            for item in deletables {
                 // the scan already sized each item; re-sizing gets only a short deadline
-                switch deleter.remove(item.path, expected: item.identity, dryRun: false,
-                                      probes: probes, sizeDeadline: Date().addingTimeInterval(3)) {
+                let outcome: DeleteOutcome
+                if rule?.trashOnly == true {
+                    outcome = deleter.trash(item.path, expected: item.identity, probes: probes,
+                                            allowance: rule?.allowance ?? .none)
+                } else {
+                    outcome = deleter.remove(item.path, expected: item.identity, dryRun: false,
+                                             probes: probes, sizeDeadline: Date().addingTimeInterval(3),
+                                             allowance: rule?.allowance ?? .none)
+                }
+                switch outcome {
                 case .removed(let size):
                     result.removedBytes += size.bytes
                     result.removedCount += 1

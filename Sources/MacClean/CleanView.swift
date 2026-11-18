@@ -45,7 +45,9 @@ final class CleanModel: ObservableObject {
                 let engine = try AppEnvironment.current.makeCleanEngine()
                 let r = await Task.detached(priority: .userInitiated) { engine.scan() }.value
                 result = r
-                selected = Set(r.groups.filter { !$0.items.isEmpty && $0.deferred == nil }.map(\.id))
+                selected = Set(r.groups.filter {
+                    !$0.items.isEmpty && $0.deferred == nil && $0.rule.defaultSelected
+                }.map(\.id))
                 phase = .ready
             } catch {
                 self.error = "화이트리스트 파일을 읽을 수 없어 정리를 중단했습니다: \(error)"
@@ -250,7 +252,8 @@ struct GroupList: View {
         List {
             ForEach(CleanSection.allCases) { section in
                 let groups = result.groups.filter {
-                    $0.rule.section == section && (!$0.items.isEmpty || $0.deferred != nil)
+                    $0.rule.section == section
+                        && (!$0.items.isEmpty || $0.deferred != nil || $0.note != nil)
                 }
                 if !groups.isEmpty {
                     let sectionBytes = groups.reduce(Int64(0)) { $0 + $1.totalBytes }
@@ -324,6 +327,28 @@ struct GroupRow: View {
                 )
             }
             .padding(.vertical, 3)
+        } else if group.items.isEmpty {
+            // fail-closed or nothing to offer — show the reason instead of a toggle
+            HStack(spacing: 10) {
+                Image(systemName: "info.circle.fill")
+                    .font(.system(size: 15))
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(koreanRuleLabel(group.rule.label))
+                        .fontWeight(.medium)
+                    if let note = group.note {
+                        Text(note)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                if !group.skipped.isEmpty {
+                    StatusPill(text: "사용 중 \(group.skipped.count)개 제외", color: .secondary,
+                               icon: "checkmark.shield")
+                }
+            }
+            .padding(.vertical, 3)
         } else {
             DisclosureGroup(isExpanded: $expanded) {
                 ForEach(group.items) { item in
@@ -361,6 +386,12 @@ struct GroupRow: View {
                                 .font(.caption2.monospaced())
                                 .foregroundStyle(.tertiary)
                                 .lineLimit(1)
+                            if let note = group.note {
+                                Text(note)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
                         }
                         Spacer()
                         StatusPill(text: "\(group.items.count)개", color: .secondary)
@@ -492,6 +523,7 @@ func koreanRuleLabel(_ label: String) -> String {
         "VS Code caches": "Visual Studio Code 캐시 및 로그",
         "Shell history temp files": "셸 임시 히스토리 파일 (.zcompdump 등)",
         "Chat app caches": "메신저 앱 캐시 (Discord · Slack)",
+        "Aerial wallpaper videos": "에어리얼 배경화면 영상",
     ]
     return map[label] ?? label
 }
