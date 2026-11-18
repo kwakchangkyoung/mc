@@ -54,15 +54,16 @@ public enum AerialVideos {
         }
         var inUse = Set<String>()
         var entries = 0
+        let choiceKeys = ["Desktop", "Idle", "Linked"]
         for (_, sectionValue) in root {
             guard let section = sectionValue as? [String: Any] else { return nil }
-            // a section either holds Desktop/Idle itself (AllSpacesAndDisplays,
+            // a section either holds Desktop/Idle/Linked itself (AllSpacesAndDisplays,
             // SystemDefault) or one level deeper (per-display Spaces/Displays entries)
-            let holders = (section["Desktop"] != nil || section["Idle"] != nil)
-                ? [section] : Array(section.values)
+            let isDirectHolder = choiceKeys.contains { section[$0] != nil } || section["Type"] != nil
+            let holders = isDirectHolder ? [section] : Array(section.values)
             for holder in holders {
                 guard let holder = holder as? [String: Any] else { return nil }
-                for key in ["Desktop", "Idle"] {
+                for key in choiceKeys {
                     guard let entry = holder[key] else { continue }
                     entries += 1
                     guard let entry = entry as? [String: Any],

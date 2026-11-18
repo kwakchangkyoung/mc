@@ -33,10 +33,12 @@ private func content(_ choices: [[String: Any]], shuffle: Bool = false) -> [Stri
     ["Choices": choices, "Shuffle": shuffle ? ["Enabled": true] : "$null"]
 }
 
-private func section(desktop: [String: Any]? = nil, idle: [String: Any]? = nil) -> [String: Any] {
-    var s: [String: Any] = ["Type": "individual"]
+private func section(desktop: [String: Any]? = nil, idle: [String: Any]? = nil,
+                     linked: [String: Any]? = nil) -> [String: Any] {
+    var s: [String: Any] = ["Type": linked != nil ? "linked" : "individual"]
     if let d = desktop { s["Desktop"] = ["Content": d] }
     if let i = idle { s["Idle"] = ["Content": i] }
+    if let l = linked { s["Linked"] = ["Content": l] }
     return s
 }
 
@@ -160,6 +162,24 @@ private func aerialGroup(_ home: String) -> CleanGroup? {
         let group = try #require(aerialGroup(home))
         #expect(group.items.isEmpty)
         #expect(group.note?.contains("사용할 수 없습니다") == true)
+    }
+
+    @Test func linkedSectionTypeSupported() throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let a = try video(home, used)
+        let b = try video(home, "99999999-1111-2222-3333-444444444444")
+        try writeIndex(home, [
+            "AllSpacesAndDisplays": section(linked: content([aerialChoice(used)])),
+            "Displays": [String: Any](),
+            "Spaces": [String: Any](),
+            "SystemDefault": section(linked: content([aerialChoice(used)])),
+        ])
+        let group = try #require(aerialGroup(home))
+        #expect(group.items.map(\.path) == [b])
+        #expect(group.skipped.contains { $0.path == a && $0.reason == .inUse })
+        #expect(group.inUseAssets == [used])
+        #expect(group.note?.contains("사용할 수 없습니다") != true)
     }
 
     @Test func missingPlistFailsClosed() throws {
