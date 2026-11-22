@@ -610,7 +610,7 @@ private let vpnNone: [String: Shell.Result] = [
             "/usr/bin/pmset -g batt": .init(status: 0, stdout: "Now drawing from 'AC Power'\n", timedOut: false),
         ])
         var e = try engine(runner)
-        e.spotlightSlowThreshold = 0  // any measurable duration counts as slow
+        e.spotlightSlowThreshold = -1  // any non-negative duration counts as slow
         let o = e.run(.spotlightIndexOptimize, dryRun: false, probes: idleProbes)
         #expect(o.kind == .unavailable)
         expectReadOnly(rec.calls)

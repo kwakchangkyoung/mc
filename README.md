@@ -95,15 +95,15 @@
 
 ![디스크 분석 화면](docs/screenshots/analyze.png)
 
-홈 폴더 및 원하는 디렉터리의 공간 점유 현황을 고속으로 분석하고 편리하게 탐색합니다.
+홈 폴더 및 원하는 디렉터리의 공간 점유 현황을 고속으로 분석하고 **중첩 스퀘어리파이드 트리맵(Nested Squarified Treemap)**과 연동 목록으로 시각화합니다.
 
 - **초고속 병렬 스캐너 (`DiskScanner`)**: macOS 저수준 `getattrlistbulk(2)` 시스템 콜과 멀티코어 워커 풀을 적용해 수십만 개의 파일이 있는 폴더도 수초 내에 분석합니다.
-- **스토리지 분포 바 (`StorageBreakdownBar`)**: 현재 폴더 내 상위 5개 항목이 차지하는 크기 비중을 시각적인 컬러 바로 한눈에 보여줍니다.
-- **자유로운 폴더 선택**: 기본 홈 폴더 외에도 상단 **`폴더 선택…`** 버튼을 통해 외장 드라이브나 특정 디렉터리를 바로 지정하여 분석할 수 있습니다.
-- **즉각적인 드릴다운 및 브레드크럼**: 스캔 트리를 메모리에 보관하여 하위 폴더를 더블클릭(또는 `Return` 키)할 때 재스캔 없이 즉시 하위 폴더로 이동하며, 상단 경로 막대를 통해 원하는 상위 경로로 자유롭게 이동합니다.
-- **항목별 보기 & 대용량 파일 탭**:
-  - **폴더 · 항목 탭**: 크기순 정렬, 점유율 게이지 바, 항목별 실제 디스크 점유 용량 및 내부 파일 수 표시
-  - **대용량 파일 탭**: 하위 경로 전체에서 1MB 이상의 대형 단일 파일 상위 20개를 추출하여 표시
+- **중첩 스퀘어리파이드 트리맵 (`DiskTreemapView` & `TreemapLayout`)**:
+  - 파일·폴더 용량에 비례하는 2D 타일 면적으로 디스크 분포를 시각화하며, 상위 폴더 내부에 하위 폴더와 파일들을 다단계로 중첩 표시하여 클릭해 들어가기 전에도 어느 하위 경로가 용량을 차지하는지 한눈에 파악할 수 있습니다.
+  - 마우스를 올리면 해당 블록의 이름, 용량, 현재 폴더 대비 점유율(%), 상위 폴더 및 파일 개수를 보여주는 **플로팅 툴팁 카드**가 표시됩니다.
+  - 트리맵 블록을 클릭하면 하단 리스트와 선택 상태가 실시간으로 연동되며, 더블클릭 시 해당 폴더로 즉시 이동합니다.
+- **자유로운 폴더 선택 및 3종 뷰 모드**: 상단 **`폴더 선택…`** 버튼으로 원하는 폴더나 외장 드라이브를 바로 열 수 있으며, **`트리맵 · 목록` / `목록만` / `대용량 파일`** 뷰 모드를 자유롭게 전환할 수 있습니다.
+- **즉각적인 드릴다운 및 브레드크럼**: 스캔 트리를 메모리에 보관하여 하위 폴더를 더블클릭(또는 `Return` 키)할 때 재스캔 없이 즉시 하위 폴더로 이동하며, 상단 경로 막대와 우측 요약 지표(`스캔 용량` · `전체 파일` · `하위 폴더`)를 제공합니다.
 - **안전한 휴지통 이동**: 우클릭 메뉴 또는 하단 버튼을 통해 항목을 Finder에서 확인하거나 안전하게 휴지통으로 이동합니다.
 
 ---
@@ -177,7 +177,7 @@ GitHub Releases에 새 버전이 배포되면 앱 내에서 원클릭으로 안�
 
 ### 방법 1: GitHub Releases에서 다운로드 (권장)
 
-1. [**GitHub Releases 페이지**](https://github.com/kwakchangkyoung/mc/releases)에서 최신 버전의 `MacClean-v0.2.4-macos.dmg` 또는 `MacClean-v0.2.4-macos.zip` 파일을 다운로드합니다.
+1. [**GitHub Releases 페이지**](https://github.com/kwakchangkyoung/mc/releases)에서 최신 버전의 `MacClean-v0.2.5-macos.dmg` 또는 `MacClean-v0.2.5-macos.zip` 파일을 다운로드합니다.
 2. **DMG 다운로드 시**: 디스크 이미지를 열고 `MacClean.app`을 `Applications`(`응용 프로그램`) 폴더로 드래그합니다.
 3. **ZIP 다운로드 시**: 압축을 풀고 `MacClean.app`을 `Applications` 폴더로 이동합니다.
 
@@ -251,8 +251,8 @@ BIN="build/MacClean.app/Contents/MacOS/MacClean"
 ### 1. Git 태그 푸시로 자동 배포 (GitHub Actions)
 
 ```bash
-git tag v0.2.4
-git push origin v0.2.4
+git tag v0.2.5
+git push origin v0.2.5
 ```
 
 GitHub Actions가 자동으로 단위 테스트를 거쳐 Universal 바이너리(`.dmg`, `.zip`, `SHA256SUMS.txt`)를 빌드하고 Release를 생성합니다.
@@ -261,14 +261,14 @@ GitHub Actions가 자동으로 단위 테스트를 거쳐 Universal 바이너리
 
 ```bash
 # 1. build/release/ 하위에 배포 파일 생성 (.dmg, .zip, SHA256SUMS.txt)
-./scripts/package-release.sh 0.2.4
+./scripts/package-release.sh 0.2.5
 
 # 2. GitHub CLI로 릴리즈 생성 및 파일 업로드
-gh release create v0.2.4 \
-  build/release/MacClean-v0.2.4-macos.dmg \
-  build/release/MacClean-v0.2.4-macos.zip \
+gh release create v0.2.5 \
+  build/release/MacClean-v0.2.5-macos.dmg \
+  build/release/MacClean-v0.2.5-macos.zip \
   build/release/SHA256SUMS.txt \
-  --title "MacClean v0.2.4" \
+  --title "MacClean v0.2.5" \
   --generate-notes
 ```
 

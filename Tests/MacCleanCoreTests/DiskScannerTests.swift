@@ -289,3 +289,32 @@ private let idleProbes = ProbeContext(
         #expect(deleter().trash("/nonexistent/nope", expected: nil, probes: idleProbes) == .missing)
     }
 }
+
+@Suite struct TreemapLayoutTests {
+    @Test func squarifiedTreemapNestsSubdirectoriesAndHitTests() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        try FileManager.default.createDirectory(atPath: dir + "/big/sub", withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(atPath: dir + "/small", withIntermediateDirectories: true)
+        try Data(count: 64 * 1024).write(to: URL(fileURLWithPath: dir + "/big/sub/a.bin"))
+        try Data(count: 32 * 1024).write(to: URL(fileURLWithPath: dir + "/big/b.bin"))
+        try Data(count: 16 * 1024).write(to: URL(fileURLWithPath: dir + "/small/c.bin"))
+
+        let result = try DiskScanner().scan(dir, keepTree: true)
+        let bounds = CGRect(x: 0, y: 0, width: 800, height: 300)
+        let cells = TreemapLayout.compute(result: result, in: bounds, maxDepth: 2)
+
+        #expect(cells.count == 2)
+        let bigCell = try #require(cells.first { $0.name == "big" })
+        let smallCell = try #require(cells.first { $0.name == "small" })
+        #expect(bigCell.rect.width * bigCell.rect.height > smallCell.rect.width * smallCell.rect.height)
+        #expect(!bigCell.children.isEmpty)
+
+        // Hit-testing inside a nested child returns the nested child cell with topLevelPath == bigCell.path
+        let child = try #require(bigCell.children.first)
+        let center = CGPoint(x: child.rect.midX, y: child.rect.midY)
+        let hit = try #require(TreemapLayout.hitTest(cells, at: center))
+        #expect(hit.topLevelPath == bigCell.path)
+        #expect(hit.depth >= 1)
+    }
+}

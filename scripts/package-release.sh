@@ -6,7 +6,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
-raw_version="${1:-${VERSION:-0.2.4}}"
+raw_version="${1:-${VERSION:-0.2.5}}"
 version="${raw_version#v}"
 
 echo "==> Building MacClean v${version}..."

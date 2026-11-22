@@ -20,11 +20,11 @@ final class UpdateModel: ObservableObject {
     private var didCheckOnLaunch = false
 
     var currentVersionString: String {
-        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.2.4"
+        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.2.5"
     }
 
     var currentVersion: SemanticVersion {
-        SemanticVersion(parsing: currentVersionString) ?? SemanticVersion(0, 2, 4)
+        SemanticVersion(parsing: currentVersionString) ?? SemanticVersion(0, 2, 5)
     }
 
     var availableRelease: ReleaseInfo? {

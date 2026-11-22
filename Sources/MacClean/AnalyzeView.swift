@@ -4,16 +4,16 @@ import SwiftUI
 
 @MainActor
 final class AnalyzeModel: ObservableObject {
-    enum Tab { case entries, largeFiles }
+    enum Tab { case treemap, entries, largeFiles }
 
-    @Published var path = AppEnvironment.current.home
+    @Published var path = "/"
     @Published var canGoBack = false
     @Published var result: AnalyzeResult?
     @Published var scanning = false
     @Published var error: String?
     @Published var trashError: String?
     @Published var selection: String?
-    @Published var tab: Tab = .entries
+    @Published var tab: Tab = .treemap
 
     private var cancellation: ScanCancellation?
     /// Aggregated scan tree backing the displayed result — makes drill-in/back instant.
@@ -105,15 +105,31 @@ final class AnalyzeModel: ObservableObject {
 
     func drill(_ entry: AnalyzeEntry) {
         guard entry.isDir, !scanning else { return }
-        // symlink targets, other volumes and folded dirs need a fresh walk: rescan
-        if let child = node?.dirs.first(where: { $0.path == entry.path }),
+        drillPath(entry.path)
+    }
+
+    func drillPath(_ targetPath: String) {
+        guard !scanning, FileStat.isDirectory(targetPath) else { return }
+        if let child = findDescendantNode(path: targetPath, in: node),
            !child.isOtherDevice, child.collected {
             backStack.append((path, node))
             canGoBack = true
             apply(child)
         } else {
-            scan(entry.path, push: true)
+            scan(targetPath, push: true)
         }
+    }
+
+    private func findDescendantNode(path targetPath: String, in rootNode: AnalyzeNode?) -> AnalyzeNode? {
+        guard let rootNode else { return nil }
+        for d in rootNode.dirs {
+            if d.path == targetPath { return d }
+            if targetPath.hasPrefix(d.path + "/"),
+               let found = findDescendantNode(path: targetPath, in: d) {
+                return found
+            }
+        }
+        return nil
     }
 
     func navigate(to crumb: String) {
@@ -168,12 +184,14 @@ struct AnalyzeView: View {
         VStack(spacing: 0) {
             PaneHeaderBar(pane: .analyze) {
                 HStack(spacing: 10) {
-                    Picker("", selection: $model.tab) {
-                        Text("폴더 · 항목").tag(AnalyzeModel.Tab.entries)
+                    Picker("보기 방식", selection: $model.tab) {
+                        Text("트리맵 · 목록").tag(AnalyzeModel.Tab.treemap)
+                        Text("목록만").tag(AnalyzeModel.Tab.entries)
                         Text("대용량 파일").tag(AnalyzeModel.Tab.largeFiles)
                     }
                     .pickerStyle(.segmented)
-                    .frame(width: 190)
+                    .labelsHidden()
+                    .fixedSize()
 
                     Button {
                         model.chooseFolder()
@@ -181,11 +199,12 @@ struct AnalyzeView: View {
                         Label("폴더 선택…", systemImage: "folder.badge.plus")
                     }
                     .controlSize(.small)
+                    .fixedSize()
                     .disabled(model.scanning)
                 }
             }
             Divider()
-            breadcrumbBar
+            breadcrumbAndStatsBar
             Divider()
             content
             Divider()
@@ -210,7 +229,7 @@ struct AnalyzeView: View {
         Binding(get: { model.trashError != nil }, set: { if !$0 { model.trashError = nil } })
     }
 
-    // MARK: breadcrumb bar
+    // MARK: breadcrumb + summary stats bar
 
     private var crumbs: [(name: String, path: String)] {
         var out = [(FileManager.default.displayName(atPath: "/"), "/")]
@@ -222,8 +241,8 @@ struct AnalyzeView: View {
         return out
     }
 
-    private var breadcrumbBar: some View {
-        HStack(spacing: 8) {
+    private var breadcrumbAndStatsBar: some View {
+        HStack(spacing: 10) {
             Button { model.goBack() } label: {
                 Image(systemName: "chevron.left")
                     .font(.system(size: 12, weight: .semibold))
@@ -265,11 +284,32 @@ struct AnalyzeView: View {
                     }
                 }
             }
-            Spacer()
+
+            Spacer(minLength: 8)
+
+            if let r = model.result {
+                let folderCount = r.entries.filter(\.isDir).count
+                HStack(spacing: 16) {
+                    statMetric(label: "스캔 용량", value: ByteFormat.string(r.totalSize))
+                    statMetric(label: "전체 파일", value: "\(r.totalFiles.formatted())개")
+                    statMetric(label: "하위 폴더", value: "\(folderCount)개")
+                }
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
+    }
+
+    private func statMetric(label: String, value: String) -> some View {
+        VStack(alignment: .trailing, spacing: 0) {
+            Text(label)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .monospacedDigit()
+        }
     }
 
     // MARK: content
@@ -289,16 +329,38 @@ struct AnalyzeView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let result = model.result {
-            VStack(spacing: 0) {
-                if !result.entries.isEmpty {
-                    StorageBreakdownBar(result: result)
-                    Divider()
-                }
-                if model.tab == .entries {
+            switch model.tab {
+            case .treemap:
+                VStack(spacing: 0) {
+                    if !result.entries.isEmpty {
+                        DiskTreemapView(
+                            result: result,
+                            selection: $model.selection,
+                            onDrill: { path in model.drillPath(path) },
+                            onReveal: { path in model.reveal(path) },
+                            onTrashTopLevel: { topPath in
+                                model.selection = topPath
+                                confirmingTrash = true
+                            }
+                        )
+                        .frame(minHeight: 235, idealHeight: 270, maxHeight: 310)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(Color(nsColor: .controlBackgroundColor).opacity(0.35))
+                        Divider()
+                    }
                     entryList(result)
-                } else {
-                    largeFileList(result)
                 }
+            case .entries:
+                VStack(spacing: 0) {
+                    if !result.entries.isEmpty {
+                        StorageBreakdownBar(result: result)
+                        Divider()
+                    }
+                    entryList(result)
+                }
+            case .largeFiles:
+                largeFileList(result)
             }
         } else {
             VStack(spacing: 12) {
@@ -458,6 +520,326 @@ struct AnalyzeView: View {
             .tint(.indigo)
             .disabled(model.selection == nil || model.scanning)
         }
+    }
+}
+
+// MARK: - Nested Squarified Treemap View
+
+struct DiskTreemapView: View {
+    let result: AnalyzeResult
+    @Binding var selection: String?
+    let onDrill: (String) -> Void
+    let onReveal: (String) -> Void
+    let onTrashTopLevel: (String) -> Void
+
+    @State private var hoverLocation: CGPoint?
+    @State private var lastClickedPath: String?
+    @State private var lastClickTime: Date = .distantPast
+
+    private var rootName: String {
+        let name = (result.root as NSString).lastPathComponent
+        return name.isEmpty || name == "/" ? FileManager.default.displayName(atPath: "/") : name
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            let bounds = CGRect(origin: .zero, size: geo.size).insetBy(dx: 4, dy: 4)
+            let cells = TreemapLayout.compute(result: result, in: bounds, maxDepth: 2)
+            let hovered = hoverLocation.flatMap { TreemapLayout.hitTest(cells, at: $0) }
+
+            ZStack(alignment: .topLeading) {
+                Canvas { context, _ in
+                    for cell in cells {
+                        drawCell(cell, in: &context, hoveredPath: hovered?.path)
+                    }
+                    // Draw selection highlight on top of everything
+                    if let sel = selection,
+                       let selCell = cells.first(where: { $0.path == sel || $0.topLevelPath == sel }) {
+                        let highlightRect = selCell.rect.insetBy(dx: 0.75, dy: 0.75)
+                        let path = Path(roundedRect: highlightRect, cornerRadius: 5)
+                        context.stroke(
+                            path,
+                            with: .color(Color(red: 0.25, green: 0.70, blue: 1.0)),
+                            lineWidth: 2.2
+                        )
+                    }
+                    // Draw hover outline
+                    if let hov = hovered {
+                        let hRect = hov.rect.insetBy(dx: 0.75, dy: 0.75)
+                        let path = Path(roundedRect: hRect, cornerRadius: 4)
+                        context.stroke(
+                            path,
+                            with: .color(Color.white.opacity(0.9)),
+                            lineWidth: 1.5
+                        )
+                    }
+                }
+                .background(
+                    Color(red: 0.08, green: 0.12, blue: 0.12),
+                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
+                )
+                .contentShape(Rectangle())
+                .onContinuousHover { phase in
+                    switch phase {
+                    case .active(let pt):
+                        hoverLocation = pt
+                    case .ended:
+                        hoverLocation = nil
+                    }
+                }
+                .gesture(
+                    SpatialTapGesture(count: 1).onEnded { event in
+                        guard let hit = TreemapLayout.hitTest(cells, at: event.location) else { return }
+                        let now = Date()
+                        if lastClickedPath == hit.path, now.timeIntervalSince(lastClickTime) < 0.35 {
+                            // Double-click → drill into the clicked directory (or its top-level folder)
+                            let drillTarget = hit.isDir ? hit.path : hit.topLevelPath
+                            onDrill(drillTarget)
+                            lastClickedPath = nil
+                        } else {
+                            selection = hit.topLevelPath
+                            lastClickedPath = hit.path
+                            lastClickTime = now
+                        }
+                    }
+                )
+                .contextMenu {
+                    if let hov = hovered {
+                        if hov.isDir {
+                            Button("“\(hov.name)” 폴더 열기") { onDrill(hov.path) }
+                        } else if hov.topLevelPath != hov.path {
+                            Button("상위 폴더 열기") { onDrill(hov.topLevelPath) }
+                        }
+                        Button("Finder에서 보기") { onReveal(hov.path) }
+                        Divider()
+                        Button("휴지통으로 이동…", role: .destructive) {
+                            onTrashTopLevel(hov.topLevelPath)
+                        }
+                    } else if let sel = selection {
+                        Button("Finder에서 보기") { onReveal(sel) }
+                        Divider()
+                        Button("휴지통으로 이동…", role: .destructive) {
+                            onTrashTopLevel(sel)
+                        }
+                    }
+                }
+
+                if let hov = hovered, let pt = hoverLocation {
+                    TreemapTooltipCard(
+                        cell: hov,
+                        rootName: rootName,
+                        rootTotalSize: result.totalSize
+                    )
+                    .offset(tooltipOffset(for: pt, in: geo.size))
+                    .allowsHitTesting(false)
+                }
+            }
+        }
+    }
+
+    private func tooltipOffset(for cursor: CGPoint, in size: CGSize) -> CGSize {
+        let cardWidth: CGFloat = 240
+        let cardHeight: CGFloat = 78
+        var x = cursor.x + 14
+        var y = cursor.y + 14
+        if x + cardWidth > size.width - 8 {
+            x = max(8, cursor.x - cardWidth - 12)
+        }
+        if y + cardHeight > size.height - 8 {
+            y = max(8, cursor.y - cardHeight - 12)
+        }
+        return CGSize(width: x, height: y)
+    }
+
+    // MARK: - Canvas cell drawing
+
+    private func drawCell(
+        _ cell: TreemapCell,
+        in context: inout GraphicsContext,
+        hoveredPath: String?
+    ) {
+        let gap: CGFloat = cell.depth == 0 ? 1.5 : 1.0
+        let box = cell.rect.insetBy(dx: gap, dy: gap)
+        guard box.width >= 2, box.height >= 2 else { return }
+
+        let radius: CGFloat = cell.depth == 0 ? 5 : (cell.depth == 1 ? 3.5 : 2.5)
+        let shape = Path(roundedRect: box, cornerRadius: radius)
+        let isHovered = cell.path == hoveredPath
+
+        if !cell.children.isEmpty {
+            // Container directory frame (emerald / jade header + darker interior well)
+            let frameColor = containerColor(depth: cell.depth, group: cell.groupIndex, hovered: isHovered)
+            context.fill(shape, with: .color(frameColor))
+            context.stroke(shape, with: .color(Color.white.opacity(0.18)), lineWidth: 0.75)
+
+            // Header title
+            let headerH: CGFloat = cell.depth == 0 ? 18 : 15
+            if box.width >= 36, box.height >= headerH {
+                let titleRect = CGRect(
+                    x: box.minX + 6,
+                    y: box.minY + 1,
+                    width: max(0, box.width - 12),
+                    height: headerH - 1
+                )
+                var clipped = context
+                clipped.clip(to: Path(titleRect))
+                let fontSize: CGFloat = cell.depth == 0 ? 11.5 : 10.5
+                let label = Text(cell.name)
+                    .font(.system(size: fontSize, weight: .bold))
+                    .foregroundColor(.white.opacity(0.95))
+                clipped.draw(label, at: CGPoint(x: titleRect.minX, y: titleRect.midY), anchor: .leading)
+            }
+
+            // Inner well background behind child tiles
+            let pad: CGFloat = cell.depth == 0 ? 2.5 : 1.5
+            let wellRect = CGRect(
+                x: box.minX + pad,
+                y: box.minY + headerH - 1,
+                width: max(0, box.width - pad * 2),
+                height: max(0, box.height - headerH - pad + 1)
+            )
+            if wellRect.width > 4, wellRect.height > 4 {
+                let wellPath = Path(roundedRect: wellRect, cornerRadius: max(2, radius - 1.5))
+                context.fill(wellPath, with: .color(Color(red: 0.08, green: 0.16, blue: 0.15).opacity(0.65)))
+            }
+
+            for child in cell.children {
+                drawCell(child, in: &context, hoveredPath: hoveredPath)
+            }
+        } else {
+            // Leaf block (file or un-subdivided directory)
+            let fill = leafColor(isDir: cell.isDir, depth: cell.depth, group: cell.groupIndex, hovered: isHovered)
+            context.fill(shape, with: .color(fill))
+            context.stroke(shape, with: .color(Color.white.opacity(0.16)), lineWidth: 0.75)
+
+            if box.width >= 38, box.height >= 17 {
+                let textRect = box.insetBy(dx: 5, dy: 3)
+                var clipped = context
+                clipped.clip(to: Path(textRect))
+
+                let nameText = Text(cell.name)
+                    .font(.system(size: cell.depth == 0 ? 11.5 : 10.5, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.95))
+                clipped.draw(nameText, at: CGPoint(x: textRect.minX, y: textRect.minY + 1), anchor: .topLeading)
+
+                if box.width >= 54, box.height >= 33 {
+                    let sizeText = Text(ByteFormat.string(cell.size))
+                        .font(.system(size: 9.5, weight: .medium))
+                        .foregroundColor(.white.opacity(0.75))
+                    clipped.draw(
+                        sizeText,
+                        at: CGPoint(x: textRect.minX, y: textRect.minY + 15),
+                        anchor: .topLeading
+                    )
+                }
+            }
+        }
+    }
+
+    private func containerColor(depth: Int, group: Int, hovered: Bool) -> Color {
+        let boost = hovered ? 0.06 : 0.0
+        switch depth {
+        case 0:
+            // Top-level emerald / jade containers
+            let variants: [(Double, Double, Double)] = [
+                (0.22, 0.62, 0.45),
+                (0.20, 0.58, 0.48),
+                (0.24, 0.60, 0.42),
+                (0.19, 0.55, 0.46),
+            ]
+            let c = variants[group % variants.count]
+            return Color(red: c.0 + boost, green: c.1 + boost, blue: c.2 + boost)
+        default:
+            return Color(red: 0.18 + boost, green: 0.50 + boost, blue: 0.42 + boost)
+        }
+    }
+
+    private func leafColor(isDir: Bool, depth: Int, group: Int, hovered: Bool) -> Color {
+        let boost = hovered ? 0.08 : 0.0
+        if isDir {
+            // Subfolder leaf: rich jade green
+            let variants: [(Double, Double, Double)] = [
+                (0.23, 0.57, 0.44),
+                (0.20, 0.52, 0.46),
+                (0.25, 0.55, 0.40),
+                (0.19, 0.49, 0.43),
+            ]
+            let c = variants[(group + depth) % variants.count]
+            return Color(red: c.0 + boost, green: c.1 + boost, blue: c.2 + boost)
+        } else {
+            // File leaf: cool ocean teal / slate blue (distinct from folder jade)
+            let variants: [(Double, Double, Double)] = [
+                (0.24, 0.48, 0.56),
+                (0.27, 0.44, 0.54),
+                (0.22, 0.51, 0.53),
+                (0.31, 0.41, 0.49),
+            ]
+            let c = variants[(group + depth) % variants.count]
+            return Color(red: c.0 + boost, green: c.1 + boost, blue: c.2 + boost)
+        }
+    }
+}
+
+struct TreemapTooltipCard: View {
+    let cell: TreemapCell
+    let rootName: String
+    let rootTotalSize: Int64
+
+    private var sharePercent: String {
+        guard rootTotalSize > 0 else { return "0%" }
+        let p = Double(cell.size) * 100.0 / Double(rootTotalSize)
+        return p < 0.1 ? "<0.1%" : String(format: "%.1f%%", p)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Image(systemName: cell.isDir ? "folder.fill" : "doc.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color(red: 0.45, green: 0.88, blue: 0.72))
+                Text(cell.name)
+                    .font(.system(size: 12.5, weight: .bold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+            }
+
+            Text("\(ByteFormat.string(cell.size)) · \(rootName)의 \(sharePercent)")
+                .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                .foregroundStyle(.white.opacity(0.92))
+                .monospacedDigit()
+
+            HStack(spacing: 5) {
+                Image(systemName: "folder")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.white.opacity(0.6))
+                Text(cell.parentName)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.white.opacity(0.7))
+                    .lineLimit(1)
+                if cell.isDir {
+                    Text("· 파일 \(cell.itemCount.formatted())개")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.white.opacity(0.7))
+                        .monospacedDigit()
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .frame(width: 240, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Color(red: 0.11, green: 0.22, blue: 0.20).opacity(0.96))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.22), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.38), radius: 10, x: 0, y: 4)
     }
 }
 

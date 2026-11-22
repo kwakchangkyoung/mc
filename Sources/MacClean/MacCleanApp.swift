@@ -219,9 +219,11 @@ struct PaneHeaderBar<Trailing: View>: View {
                 Text(pane.subtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
-            Spacer()
+            Spacer(minLength: 12)
             trailing()
+                .fixedSize(horizontal: true, vertical: false)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)

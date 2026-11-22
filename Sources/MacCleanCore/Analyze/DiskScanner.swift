@@ -79,13 +79,13 @@ public final class AnalyzeNode: @unchecked Sendable {
     public let collected: Bool
     /// Subdirectory nodes (drillable).
     public let dirs: [AnalyzeNode]
-    let files: [ChildFile]
+    public let files: [ChildFile]
     /// Top large-file candidates inside this subtree (same selection as a rescan).
-    let topFiles: [LargeFile]
+    public let topFiles: [LargeFile]
 
-    init(path: String, name: String, size: Int64, childrenTotal: Int64, itemCount: Int,
-         partial: Bool, identity: PathIdentity, isOtherDevice: Bool, collected: Bool,
-         dirs: [AnalyzeNode], files: [ChildFile], topFiles: [LargeFile]) {
+    public init(path: String, name: String, size: Int64, childrenTotal: Int64, itemCount: Int,
+                partial: Bool, identity: PathIdentity, isOtherDevice: Bool, collected: Bool,
+                dirs: [AnalyzeNode], files: [ChildFile], topFiles: [LargeFile]) {
         self.path = path; self.name = name; self.size = size
         self.childrenTotal = childrenTotal; self.itemCount = itemCount
         self.partial = partial; self.identity = identity; self.isOtherDevice = isOtherDevice
@@ -104,7 +104,7 @@ public final class AnalyzeNode: @unchecked Sendable {
         var rows = dirs.map(\.entry)
         rows += files.map {
             // a symlink whose target is a directory is drillable, matching a fresh scan
-            let p = path + "/" + $0.name
+            let p = DiskScanner.join(path, $0.name)
             return AnalyzeEntry(name: $0.name, path: p, size: $0.size,
                                 isDir: $0.isSymlink && DiskScanner.isDirTarget(p),
                                 isSymlink: $0.isSymlink, itemCount: $0.itemCount,
@@ -315,7 +315,7 @@ public struct DiskScanner: Sendable {
                                    partial: rootWork.partial,
                                    cancelled: cancellation?.isCancelled == true)
         for f in rootWork.files {
-            let p = root + "/" + f.name
+            let p = Self.join(root, f.name)
             result.entries.append(AnalyzeEntry(
                 name: f.name, path: p, size: f.size,
                 isDir: f.isSymlink && Self.isDirTarget(p), isSymlink: f.isSymlink,
@@ -467,13 +467,17 @@ public struct DiskScanner: Sendable {
         return opened
     }
 
+    static func join(_ dir: String, _ name: String) -> String {
+        dir == "/" ? "/" + name : dir + "/" + name
+    }
+
     /// Accumulate one bulk entry into the dir's totals; queue same-device subdirs.
     private func handle(_ entry: BulkEntry, of work: DirWork, rootDev: UInt64,
                         seen: SeenLinks, keepChildren: Bool,
                         discovered: inout [DirWork], accum: inout Accum) {
         let size = min(entry.allocSize, entry.dataLength)     // Mole getActualFileSize
         let fileID = FileID(dev: UInt64(entry.dev), ino: entry.ino)
-        let childPath = work.path + "/" + entry.name
+        let childPath = Self.join(work.path, entry.name)
         switch entry.objtype {
         case 2:                                                 // VDIR
             // DEVID reports the covering volume on a mount point — treat as other-device
